@@ -25,15 +25,16 @@ By dividing the robot's degrees of freedom naturally between two hands, control 
 *(Note: Left-handed or alternate operator preference? Press **`[S]`** to swap hand roles instantly!)*
 
 ---
-
 ## Features
 
+- **Coordinated Height & Reach Control**: When you move your hand up/down, shoulder_lift AND elbow_flex move together using calibrated paired poses, so the arm moves in pure vertical and horizontal directions rather than individual joints.
+- **Full Workspace Calibration**: Teach the arm your desk height, highest reach, most-forward extension, and most-retracted position — the system then maps your hand movement to the full 3D workspace.
 - **All-in-One Startup Prompt**: Automatically asks `Do you wish to calibrate the arm workspace limits first? [y/N]` when launching with `--robot`, allowing calibration, verification, and live teleoperation in a **single command**.
 - **Offline Voice Control ("On" / "Off")**: Speak **"On"** to engage the arm clutch, and **"Off"** to freeze/deactivate the arm. 100% offline, private, and zero latency via Vosk and SoundDevice.
 - **Live Real-Time Motor Angle Readout**: The calibration utility streams real-time physical joint angles in your terminal as you move the arm by hand, with intelligent auto-centering safety fallbacks.
-- **Custom Workspace Limits Calibration (`--calibrate-limits`)**: Interactively teach and save your desk's exact safe table-contact height, ceiling clearance, and pan limits in 20 seconds.
+- **Custom Workspace Limits Calibration (`--calibrate-limits`)**: Interactively teach and save your desk's exact safe table-contact height, ceiling clearance, forward reach, and pan limits.
 - **Safe Dry-Run Sweep (`--test-sweep`)**: Smoothly verifies all motions across your calibrated limits before live teleoperation begins.
-- **Intuitive Elevation Mapping**: Moving your hand **UP** commands the arm **UP**; moving your hand **DOWN** commands the arm **DOWN**.
+- **Intuitive Dual-Hand Mapping**: Moving your hand **UP** makes the arm go **UP**. Pushing your hand **forward** makes the arm reach **forward**. Completely natural.
 - **Full On-Screen Range of Motion**: Scaled so that moving between the visual markers (`▲ UP` and `▼ DOWN`) inside the target box commands the arm's **entire useful vertical travel** without awkward off-screen reaching.
 - **Decoupled Dual-Hand Tracking**: Simultaneous 30+ FPS landmark tracking of both hands via Google MediaPipe Tasks.
 - **Side-by-Side Dual-Pane UI**: Dark HUD control dashboard on the left (380px), completely unobstructed live camera view on the right (960px).
@@ -43,7 +44,7 @@ By dividing the robot's degrees of freedom naturally between two hands, control 
 - **Runtime Direction & Role Toggles**:
   - Press **`[I]`** (or `--invert-lift`) to invert lift direction if desired.
   - Press **`[S]`** (or `--swap`) to swap hand roles (`Left=Position, Right=Tool` $\leftrightarrow$ `Right=Position, Left=Tool`).
-- **Independent Calibration**: Press **`[C]`** to zero both hands simultaneously at your comfortable resting height.
+- **Press `[C]`** to re-zero the tool hand (wrist roll/pitch neutral reference).
 - **Live Hardware Integration**: Seamlessly interfaces with LeRobot's `SOFollower` and Feetech STS3215 bus.
 
 ---
@@ -123,13 +124,15 @@ Every desk height, mounting clamp, and workspace differs. The calibration utilit
 ### 1. Live Terminal Calibration Readout
 When calibrating (either at startup or via `python visualizer.py --calibrate-limits --port /dev/ttyACM1`), motor torque is disabled and the terminal streams live angles as you move the arm:
 ```text
-  [LIVE MOTOR ANGLES]  Pan:   12.4° | Lift:   48.2° | Elbow:   64.1° | Wrist:  -28.0° | Grip:  85.0%
+  Pan:  12.4  Lift:  48.2  Elbow:  64.1
 ```
 - **Step 1 (Lowest Pick Position)**: Guide the gripper to touch your table surface $\rightarrow$ press **`[ENTER]`**.
 - **Step 2 (Highest Reach)**: Move the arm to its highest safe clearance in the air $\rightarrow$ press **`[ENTER]`**.
 - **Step 3 (Neutral Pose)**: Move to your comfortable resting pose $\rightarrow$ press **`[ENTER]`**.
-- **Step 4 (Pan Range)**: Move to your leftmost and rightmost workspace bounds $\rightarrow$ press **`[ENTER]`**.
-- **Step 5 (Gripper)**: Squeeze closed and open fully $\rightarrow$ press **`[ENTER]`**.
+- **Step 4 (Fully Extended Forward)**: Extend the arm as far forward as it can safely reach $\rightarrow$ press **`[ENTER]`**.
+- **Step 5 (Retracted Close to Base)**: Pull the arm close to the base with elbow bent $\rightarrow$ press **`[ENTER]`**.
+- **Step 6 (Pan Range)**: Move to your leftmost and rightmost workspace bounds $\rightarrow$ press **`[ENTER]`**.
+- **Step 7 (Gripper)**: Squeeze closed and open fully $\rightarrow$ press **`[ENTER]`**.
 
 *Safety Features*: Includes auto-centering protection (ensuring neutral pose stays strictly between up and down even if the arm drops under gravity) and auto-symmetric pan bounds.
 
@@ -145,12 +148,12 @@ The arm cycles: `Neutral` $\rightarrow$ `High Reach` $\rightarrow$ `Low Desk` $\
 ## Control Mapping
 
 ### Left Hand: Arm Position (3-DOF)
-| Hand Gesture | Controlled Joint | Description |
+| Hand Gesture | Effect | Joints Moved |
 |---|---|---|
-| **Move Hand Up / Down** | `shoulder_lift` | **Lifts arm UP (hand up) or lowers arm DOWN (hand down)** |
-| **Move Hand Left / Right** | `shoulder_pan` | Rotates base yaw left or right ($\pm 60^\circ$) |
-| **Push Hand Closer to Camera** | `elbow_flex` | Extends arm reach forward |
-| **Pull Hand Back Away from Camera** | `elbow_flex` | Retracts arm back towards base |
+| **Move Hand Up / Down** | **Arm goes UP / DOWN** (pure height change) | `shoulder_lift` + `elbow_flex` (coordinated pair) |
+| **Move Hand Left / Right** | Base rotation left or right ($\pm 60^\circ$) | `shoulder_pan` |
+| **Push Hand Toward Camera** | **Arm reaches FORWARD** (extends) | `shoulder_lift` + `elbow_flex` (coordinated pair) |
+| **Pull Hand Away from Camera** | **Arm retracts BACKWARD** (close to base) | `shoulder_lift` + `elbow_flex` (coordinated pair) |
 
 ### Right Hand: Wrist Orientation & Gripper (3-DOF)
 | Hand Gesture | Controlled Joint | Description |
@@ -169,16 +172,18 @@ The arm cycles: `Neutral` $\rightarrow$ `High Reach` $\rightarrow$ `Low Desk` $\
    - Place your **Left Hand** inside the left target box on screen.
    - Place your **Right Hand** inside the right target box on screen.
 3. Observe both target boxes turn **glowing green** (`READY: Neutral Zone`).
-4. **Press `[C]`** on your keyboard:
-   - Calibrates your current hand height and position as the neutral reference.
-5. **Engage Clutch (Voice or Keyboard)**:
+4. **Engage Clutch (Voice or Keyboard)**:
    - **Voice**: Speak **"On"** into your microphone to engage tracking; speak **"Off"** to disengage and freeze.
    - **Keyboard**: Hold **`[SPACE]`** for momentary clutch (arm moves while held, freezes when released), or press **`[T]`** to toggle continuous mode.
    - The arm smoothly glides into alignment via the slew-rate limiter.
-6. **Move hand up and down**:
-   - Move your hand up towards `▲ HIGH (UP)` to lift the arm into the air.
-   - Move your hand down towards `▼ LOW (DOWN)` to reach down to the desk.
-   - The entire range of motion is achieved comfortably inside the target box!
+5. **Move your left hand** to control the arm:
+   - Move **UP / DOWN** $\rightarrow$ arm height goes UP / DOWN.
+   - Move **LEFT / RIGHT** $\rightarrow$ arm base rotates left / right.
+   - Push **TOWARD camera** $\rightarrow$ arm extends forward. Pull **AWAY** $\rightarrow$ arm retracts.
+6. **Use your right hand** to control the gripper:
+   - **Pinch** thumb and index $\rightarrow$ gripper closes. **Separate** $\rightarrow$ gripper opens.
+   - **Rotate** your wrist $\rightarrow$ gripper rotates.
+   - **Tilt** your wrist up/down $\rightarrow$ gripper pitches up/down.
 
 ---
 
@@ -190,7 +195,7 @@ The arm cycles: `Neutral` $\rightarrow$ `High Reach` $\rightarrow$ `Low Desk` $\
 | **Voice "Off"** | Disengage Arm | Deactivates arm tracking and holds position |
 | **`[SPACE]`** (Hold) | Clutch Hold | Drive arm while held, freeze on release |
 | **`[T]`** | Toggle Clutch | Toggle continuous tracking ON / OFF |
-| **`[C]`** | Zero Neutral | Calibrate neutral reference poses for both hands |
+| **`[C]`** | Zero Tool Hand | Re-zero wrist roll/pitch neutral for tool hand |
 | **`[I]`** | Invert Lift | Invert vertical lift direction (`Up` $\leftrightarrow$ `Down`) |
 | **`[S]`** | Swap Roles | Swap hand roles (`Left=Pos, Right=Tool` $\leftrightarrow$ `Right=Pos, Left=Tool`) |
 | **`[Q]`** / **`[ESC]`** | Exit | Exit application and safely disable arm torque |

@@ -9,7 +9,15 @@
     "right": 60.0
   },
   "elbow_flex": {
-    "neutral": 65.0
+    "neutral": 65.0,
+    "extended": 30.0,
+    "retracted": 85.0
+  },
+  "reach_poses": {
+    "forward": {"lift": 70.0, "elbow": 30.0},
+    "backward": {"lift": 40.0, "elbow": 85.0},
+    "high": {"lift": 15.0, "elbow": 55.0},
+    "low": {"lift": 95.0, "elbow": 75.0}
   },
   "wrist_flex": {
     "neutral": -30.0
@@ -19,6 +27,6 @@
     "open": 98.0
   },
   "calibrated": false,
-  "description": "Default baseline limits for SO-101. Run calibration to tune to your desk.",
-  "timestamp": "2026-09-28 17:58:00"
+  "description": "Default baseline limits with reach poses for SO-101. Run calibration to tune.",
+  "timestamp": "2026-09-28 22:50:00"
 }

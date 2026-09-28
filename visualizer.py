@@ -2,26 +2,22 @@
 """
 SO-101 Dual-Hand Real-Time Teleoperation Visualizer
 Controls the 6-DOF SO-101 follower arm using TWO hands via laptop webcam:
-  - Left Hand  -> Arm 3D Position (Absolute Box Mapping):
-      * Wrist Y in target box -> shoulder_lift (top=UP, bottom=DOWN)
-      * Wrist X in target box -> shoulder_pan (left=Left, right=Right)
-      * Palm scale (distance) -> elbow_flex (closer=extend, farther=retract)
-  - Right Hand -> End-Effector Orientation & Gripper:
-      * Wrist Tilt (Pitch) -> wrist_flex (Gripper Pitch Up/Down)
-      * Wrist Roll (Roll)  -> wrist_roll (Gripper Roll CW/CCW)
-      * Pinch (Distance)   -> gripper (0% Closed - 100% Open)
+
+  LEFT HAND → Arm Position (3 axes):
+    • Up/Down (hand Y in box)    → arm HEIGHT (coordinated shoulder_lift + elbow_flex)
+    • Left/Right (hand X in box) → shoulder_pan (base rotation)
+    • Forward/Back (hand depth)  → arm REACH (coordinated shoulder_lift + elbow_flex)
+
+  RIGHT HAND → Tool / Gripper (3 axes):
+    • Pinch thumb + index → gripper open/close
+    • Rotate wrist        → gripper rotation (wrist_roll)
+    • Tilt wrist up/down  → gripper pitch (wrist_flex)
 
 Control Philosophy:
-  The target box on screen IS the arm's workspace. Hand at the TOP of the box
-  = arm at its highest calibrated reach. Hand at BOTTOM = arm at desk level.
-  No manual hand-zeroing needed — just place your hand in the box and go.
-
-Key Features:
-- Absolute Box-Position Mapping: Where you place your hand in the box = where the arm goes.
-- Integrated Startup Prompt: Calibrate workspace limits + teleoperate in ONE command.
-- Offline Voice Control: Speak "On" to activate, "Off" to freeze the arm.
-- Decoupled Dual-Hand Control: Position hand movement doesn't disturb wrist/grip.
-- Slew-rate velocity limiter for smooth bumpless engagement.
+  Height and reach both move shoulder_lift and elbow_flex together in coordinated
+  pairs recorded during calibration. This makes the arm feel like it's moving
+  in pure up/down and forward/backward directions, rather than individual joints.
+  The on-screen target box maps directly to the arm's workspace.
 """
 
 import argparse
@@ -259,28 +255,42 @@ def calibrate_arm_limits(robot_port: str = "/dev/ttyACM1", save_path: Path = DEF
 
         # Step 3: Preferred Neutral resting pose
         step3 = ("STEP 3: Move the arm to your preferred NEUTRAL working pose\n"
-                 "        (A comfortable mid-height elevation between desk and top reach).")
+                 "        (A comfortable mid-height, mid-reach working position).")
         pos_mid = wait_for_enter_with_live_readout(robot, step3)
         mid_lift = float(pos_mid["shoulder_lift"])
         mid_elbow = float(pos_mid["elbow_flex"])
         mid_wrist = float(pos_mid["wrist_flex"])
 
-        # Step 4: Base pan boundaries
-        step4a = "STEP 4a: Rotate the arm base by hand to your LEFT workspace boundary."
-        pos_left = wait_for_enter_with_live_readout(robot, step4a)
+        # Step 4: Most forward extended reach
+        step4 = ("STEP 4: Extend the arm FULLY FORWARD (maximum reach)\n"
+                 "        (Straighten elbow, reach as far forward as safe).")
+        pos_fwd = wait_for_enter_with_live_readout(robot, step4)
+        fwd_lift = float(pos_fwd["shoulder_lift"])
+        fwd_elbow = float(pos_fwd["elbow_flex"])
+
+        # Step 5: Most retracted close to base
+        step5 = ("STEP 5: Retract the arm CLOSE TO BASE (minimum reach)\n"
+                 "        (Bend elbow, pull arm close to the base/body).")
+        pos_back = wait_for_enter_with_live_readout(robot, step5)
+        back_lift = float(pos_back["shoulder_lift"])
+        back_elbow = float(pos_back["elbow_flex"])
+
+        # Step 6: Base pan boundaries
+        step6a = "STEP 6a: Rotate the arm base by hand to your LEFT workspace boundary."
+        pos_left = wait_for_enter_with_live_readout(robot, step6a)
         pan_left = float(pos_left["shoulder_pan"])
 
-        step4b = "STEP 4b: Rotate the arm base by hand to your RIGHT workspace boundary."
-        pos_right = wait_for_enter_with_live_readout(robot, step4b)
+        step6b = "STEP 6b: Rotate the arm base by hand to your RIGHT workspace boundary."
+        pos_right = wait_for_enter_with_live_readout(robot, step6b)
         pan_right = float(pos_right["shoulder_pan"])
 
-        # Step 5: Gripper closed & open
-        step5a = "STEP 5a: Squeeze the gripper fully CLOSED by hand."
-        pos_closed = wait_for_enter_with_live_readout(robot, step5a)
+        # Step 7: Gripper closed & open
+        step7a = "STEP 7a: Squeeze the gripper fully CLOSED by hand."
+        pos_closed = wait_for_enter_with_live_readout(robot, step7a)
         grip_closed = float(pos_closed["gripper"])
 
-        step5b = "STEP 5b: Open the gripper fully by hand."
-        pos_open = wait_for_enter_with_live_readout(robot, step5b)
+        step7b = "STEP 7b: Open the gripper fully by hand."
+        pos_open = wait_for_enter_with_live_readout(robot, step7b)
         grip_open = float(pos_open["gripper"])
 
         # Sanity Checks & Auto-Corrections
@@ -317,6 +327,14 @@ def calibrate_arm_limits(robot_port: str = "/dev/ttyACM1", save_path: Path = DEF
             },
             "elbow_flex": {
                 "neutral": round(mid_elbow, 1),
+                "extended": round(fwd_elbow, 1),
+                "retracted": round(back_elbow, 1),
+            },
+            "reach_poses": {
+                "forward": {"lift": round(fwd_lift, 1), "elbow": round(fwd_elbow, 1)},
+                "backward": {"lift": round(back_lift, 1), "elbow": round(back_elbow, 1)},
+                "high": {"lift": round(up_lift, 1), "elbow": round(float(pos_high['elbow_flex']), 1)},
+                "low": {"lift": round(down_lift, 1), "elbow": round(float(pos_low['elbow_flex']), 1)},
             },
             "wrist_flex": {
                 "neutral": round(mid_wrist, 1),
@@ -326,13 +344,16 @@ def calibrate_arm_limits(robot_port: str = "/dev/ttyACM1", save_path: Path = DEF
                 "open": round(max_grip, 1),
             },
             "calibrated": True,
-            "description": "Custom verified physical workspace limits",
+            "description": "Custom verified physical workspace limits with reach poses",
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
         print("\n" + "=" * 65)
         print("CALIBRATION SUMMARY:")
         print(f"  • Elevation (Lift) : [UP: {up_lift:.1f}°] -> [NEUTRAL: {mid_lift:.1f}°] -> [DOWN: {down_lift:.1f}°]")
+        print(f"  • Reach (Elbow)    : [RETRACTED: {back_elbow:.1f}°] -> [NEUTRAL: {mid_elbow:.1f}°] -> [EXTENDED: {fwd_elbow:.1f}°]")
+        print(f"  • Forward Pose     : Lift={fwd_lift:.1f}°, Elbow={fwd_elbow:.1f}°")
+        print(f"  • Backward Pose    : Lift={back_lift:.1f}°, Elbow={back_elbow:.1f}°")
         print(f"  • Base Pan (Yaw)   : [{min_pan:.1f}° (Left) .. {max_pan:.1f}° (Right)]")
         print(f"  • Gripper Range    : [{min_grip:.1f}% (Closed) .. {max_grip:.1f}% (Open)]")
         print("=" * 65)
@@ -460,21 +481,21 @@ def run_test_sweep(robot, limits: Dict) -> None:
 
 class DualHandPoseMapper:
     """
-    Decoupled Dual-Hand 6-DOF Mapper using ABSOLUTE box-position mapping.
+    Decoupled Dual-Hand 6-DOF Mapper.
 
-    Position Hand (default: Left):
-      - Wrist Y position within target box → shoulder_lift (top=UP, bottom=DOWN)
-      - Wrist X position within target box → shoulder_pan (left=Left, right=Right)
-      - Palm scale (hand distance to camera) → elbow_flex (closer=extend, farther=retract)
+    Position Hand (default: Left) — Absolute Box-Position Mapping:
+      - Wrist Y in target box → arm HEIGHT (up/down)
+        Uses calibrated paired (shoulder_lift, elbow_flex) poses at high and low
+        positions so that height changes feel like pure vertical movement.
+      - Wrist X in target box → shoulder_pan (left/right base rotation)
+      - Palm scale (hand closer/farther from camera) → arm REACH (forward/backward)
+        Uses calibrated paired (shoulder_lift, elbow_flex) poses at forward and
+        retracted positions so that reach changes feel like pure depth movement.
 
     Tool Hand (default: Right):
-      - Palm rotation angle → wrist_roll
-      - Wrist-to-MCP pitch → wrist_flex
-      - Thumb-index pinch distance → gripper
-
-    The key insight: the target box on screen IS the workspace. Hand at top of
-    box = arm at its highest calibrated reach. Hand at bottom = arm at its lowest.
-    No fragile "neutral point" auto-detection needed for position control.
+      - Palm rotation angle → wrist_roll (gripper rotation)
+      - Thumb-index pinch distance → gripper (open/close)
+      - Wrist-to-MCP pitch → wrist_flex (gripper tilt)
     """
 
     def __init__(self, ema_alpha: float = 0.25, invert_lift: bool = False,
@@ -483,7 +504,7 @@ class DualHandPoseMapper:
         self.ema_alpha = ema_alpha
         self.pos_box = pos_box  # (x1, y1, x2, y2) in normalized camera coords
 
-        # Tool hand reference (still uses relative offsets for rotation/pitch)
+        # Tool hand reference (relative offsets for rotation/pitch)
         self.tool_neutral_roll = 0.0
         self.tool_neutral_pitch = -70.0
         self.tool_calibrated = False
@@ -491,32 +512,53 @@ class DualHandPoseMapper:
         self.swap_roles = False
         self.invert_lift = invert_lift
 
-        # Joint range from calibrated limits
-        if limits and "shoulder_lift" in limits:
-            self.up_lift_deg = limits["shoulder_lift"].get("up", 15.0)
-            self.down_lift_deg = limits["shoulder_lift"].get("down", 95.0)
-            self.mid_lift_deg = limits["shoulder_lift"].get("neutral", 55.0)
-        else:
-            self.up_lift_deg = 15.0
-            self.down_lift_deg = 95.0
-            self.mid_lift_deg = 55.0
+        # === Height axis: calibrated paired (lift, elbow) poses ===
+        # When the user recorded "arm at highest" and "arm at lowest",
+        # both shoulder_lift AND elbow_flex were recorded. We interpolate
+        # both together so that moving your hand up/down produces coordinated
+        # joint movement that feels like pure vertical motion.
+        reach_poses = limits.get("reach_poses", {}) if limits else {}
 
+        high_pose = reach_poses.get("high", {})
+        low_pose = reach_poses.get("low", {})
+        fwd_pose = reach_poses.get("forward", {})
+        back_pose = reach_poses.get("backward", {})
+
+        # Height axis endpoints (paired lift + elbow)
+        if limits and "shoulder_lift" in limits:
+            self.high_lift = high_pose.get("lift", limits["shoulder_lift"].get("up", 15.0))
+            self.high_elbow = high_pose.get("elbow", limits.get("elbow_flex", {}).get("neutral", 65.0))
+            self.low_lift = low_pose.get("lift", limits["shoulder_lift"].get("down", 95.0))
+            self.low_elbow = low_pose.get("elbow", limits.get("elbow_flex", {}).get("neutral", 65.0))
+            self.mid_lift = limits["shoulder_lift"].get("neutral", 55.0)
+        else:
+            self.high_lift = 15.0
+            self.high_elbow = 65.0
+            self.low_lift = 95.0
+            self.low_elbow = 65.0
+            self.mid_lift = 55.0
+
+        # Reach axis endpoints (paired lift + elbow)
+        self.fwd_lift = fwd_pose.get("lift", self.mid_lift)
+        self.fwd_elbow = fwd_pose.get("elbow", limits.get("elbow_flex", {}).get("extended", 30.0) if limits else 30.0)
+        self.back_lift = back_pose.get("lift", self.mid_lift)
+        self.back_elbow = back_pose.get("elbow", limits.get("elbow_flex", {}).get("retracted", 85.0) if limits else 85.0)
+
+        # Pan range
         self.pan_left_deg = limits.get("shoulder_pan", {}).get("left", -60.0) if limits else -60.0
         self.pan_right_deg = limits.get("shoulder_pan", {}).get("right", 60.0) if limits else 60.0
+
+        # Neutral elbow for initial pose
         self.base_elbow = limits.get("elbow_flex", {}).get("neutral", 65.0) if limits else 65.0
 
-        # Elbow range for scale-based reach
-        self.elbow_extend = max(self.base_elbow - 40.0, DEFAULT_LIMITS["elbow_flex"][0])
-        self.elbow_retract = min(self.base_elbow + 20.0, DEFAULT_LIMITS["elbow_flex"][1])
-
-        # Reference palm scale (set on first frame for depth mapping)
+        # Reference palm scale (set on first detection for depth/reach mapping)
         self.pos_neutral_scale = 0.0
         self.scale_calibrated = False
 
         # Active smoothed joint targets
         self.smoothed_joints: Dict[str, float] = {
             "shoulder_pan": 0.0,
-            "shoulder_lift": self.mid_lift_deg,
+            "shoulder_lift": self.mid_lift,
             "elbow_flex": self.base_elbow,
             "wrist_flex": -30.0,
             "wrist_roll": 0.0,
@@ -530,15 +572,21 @@ class DualHandPoseMapper:
 
     def compute_position(self, landmarks_norm: List[Tuple[float, float, float]]) -> Tuple[Dict[str, float], Dict[str, float]]:
         """
-        Maps the position hand's wrist location ABSOLUTELY within the target box
-        to shoulder_pan, shoulder_lift, and elbow_flex.
+        Maps the position hand to arm joints using two independent axes:
 
-        The box boundaries define the full joint range:
-          - Box top    (y1) → arm at up_lift_deg (highest reach)
-          - Box bottom (y2) → arm at down_lift_deg (desk level)
-          - Box left   (x1) → arm at pan_left_deg
-          - Box right  (x2) → arm at pan_right_deg
-          - Box center (cx) → arm at pan 0° (straight ahead)
+        HEIGHT axis (hand Y in box):
+          Top of box → (high_lift, high_elbow)   = arm at highest
+          Bottom     → (low_lift, low_elbow)     = arm at desk level
+          Both joints interpolate together for natural vertical movement.
+
+        REACH axis (palm scale / hand depth):
+          Hand forward (larger) → (fwd_lift, fwd_elbow) = arm extended
+          Hand back (smaller)   → (back_lift, back_elbow) = arm retracted
+          Both joints interpolate together for natural depth movement.
+
+        The final joint angles are a blend:
+          shoulder_lift = height_component + reach_offset
+          elbow_flex    = height_component + reach_offset
         """
         pts = np.array([[lm[0], lm[1], lm[2]] for lm in landmarks_norm])
         wrist = pts[0]
@@ -553,33 +601,51 @@ class DualHandPoseMapper:
 
         bx1, by1, bx2, by2 = self.pos_box
 
-        # 1. Shoulder Lift: Map wrist Y within box to [up_lift, down_lift]
-        #    Hand at top of box (y=by1) → up_lift (arm reaches high)
-        #    Hand at bottom of box (y=by2) → down_lift (arm reaches to desk)
-        t_y = float(np.clip((wrist[1] - by1) / (by2 - by1), 0.0, 1.0))
+        # === HEIGHT AXIS: hand Y position in box ===
+        t_h = float(np.clip((wrist[1] - by1) / (by2 - by1), 0.0, 1.0))
         if self.invert_lift:
-            t_y = 1.0 - t_y
-        target_lift = self.up_lift_deg + t_y * (self.down_lift_deg - self.up_lift_deg)
-        target_lift = float(np.clip(target_lift, DEFAULT_LIMITS["shoulder_lift"][0], DEFAULT_LIMITS["shoulder_lift"][1]))
+            t_h = 1.0 - t_h
+        # t_h: 0.0 = top of box (HIGH), 1.0 = bottom of box (LOW)
 
-        # 2. Shoulder Pan: Map wrist X within box to [pan_left, pan_right]
-        #    Hand at left edge (x=bx1) → pan_left_deg
-        #    Hand at right edge (x=bx2) → pan_right_deg
+        # Interpolate paired joints for height
+        height_lift = self.high_lift + t_h * (self.low_lift - self.high_lift)
+        height_elbow = self.high_elbow + t_h * (self.low_elbow - self.high_elbow)
+
+        # === REACH AXIS: palm scale (forward/backward) ===
+        if self.scale_calibrated and self.pos_neutral_scale > 0.02:
+            depth_ratio = (scale - self.pos_neutral_scale) / max(self.pos_neutral_scale, 0.01)
+            t_r = float(np.clip(0.5 + depth_ratio / 0.5, 0.0, 1.0))
+            # t_r: 0.0 = hand far from camera (RETRACTED), 1.0 = hand close to camera (EXTENDED)
+        else:
+            t_r = 0.5  # neutral reach
+
+        # Compute reach offset relative to the neutral pose
+        # At t_r=0.5 (neutral), offset is zero
+        # At t_r=1.0 (forward), offset pushes toward forward pose
+        # At t_r=0.0 (backward), offset pushes toward backward pose
+        mid_reach_lift = (self.fwd_lift + self.back_lift) / 2.0
+        mid_reach_elbow = (self.fwd_elbow + self.back_elbow) / 2.0
+
+        if t_r >= 0.5:
+            reach_t = (t_r - 0.5) * 2.0  # 0 to 1
+            reach_lift_offset = reach_t * (self.fwd_lift - mid_reach_lift)
+            reach_elbow_offset = reach_t * (self.fwd_elbow - mid_reach_elbow)
+        else:
+            reach_t = (0.5 - t_r) * 2.0  # 0 to 1
+            reach_lift_offset = reach_t * (self.back_lift - mid_reach_lift)
+            reach_elbow_offset = reach_t * (self.back_elbow - mid_reach_elbow)
+
+        # Combine: height baseline + reach offset
+        target_lift = height_lift + reach_lift_offset
+        target_elbow = height_elbow + reach_elbow_offset
+
+        target_lift = float(np.clip(target_lift, DEFAULT_LIMITS["shoulder_lift"][0], DEFAULT_LIMITS["shoulder_lift"][1]))
+        target_elbow = float(np.clip(target_elbow, DEFAULT_LIMITS["elbow_flex"][0], DEFAULT_LIMITS["elbow_flex"][1]))
+
+        # === PAN AXIS: hand X position in box ===
         t_x = float(np.clip((wrist[0] - bx1) / (bx2 - bx1), 0.0, 1.0))
         target_pan = self.pan_left_deg + t_x * (self.pan_right_deg - self.pan_left_deg)
         target_pan = float(np.clip(target_pan, DEFAULT_LIMITS["shoulder_pan"][0], DEFAULT_LIMITS["shoulder_pan"][1]))
-
-        # 3. Elbow Flex: Map palm scale to reach (closer to camera = extend arm)
-        if self.scale_calibrated and self.pos_neutral_scale > 0.02:
-            depth_ratio = (scale - self.pos_neutral_scale) / max(self.pos_neutral_scale, 0.01)
-            norm_reach = float(np.clip(depth_ratio / 0.4, -1.0, 1.0))
-            if norm_reach > 0:
-                target_elbow = self.base_elbow - norm_reach * (self.base_elbow - self.elbow_extend)
-            else:
-                target_elbow = self.base_elbow - norm_reach * (self.elbow_retract - self.base_elbow)
-        else:
-            target_elbow = self.base_elbow
-        target_elbow = float(np.clip(target_elbow, DEFAULT_LIMITS["elbow_flex"][0], DEFAULT_LIMITS["elbow_flex"][1]))
 
         pos_targets = {
             "shoulder_pan": target_pan,
@@ -591,8 +657,8 @@ class DualHandPoseMapper:
         for k in pos_targets:
             self.smoothed_joints[k] = self.ema_alpha * pos_targets[k] + (1.0 - self.ema_alpha) * self.smoothed_joints[k]
 
-        # Compute normalized position for HUD display
-        norm_y = (t_y - 0.5) * 2.0  # -1.0 (top/UP) to +1.0 (bottom/DOWN)
+        # Compute normalized positions for HUD display
+        norm_y = (t_h - 0.5) * 2.0  # -1.0 (top/UP) to +1.0 (bottom/DOWN)
         if self.invert_lift:
             norm_y = -norm_y
 
