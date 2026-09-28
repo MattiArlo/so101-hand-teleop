@@ -19,6 +19,6 @@
     "open": 98.0
   },
   "calibrated": false,
-  "description": "Default baseline limits for SO-101 workspace. Run calibration to tune to your exact desk.",
-  "timestamp": "2026-09-28 17:35:00"
+  "description": "Default baseline limits for SO-101. Run calibration to tune to your desk.",
+  "timestamp": "2026-09-28 17:58:00"
 }

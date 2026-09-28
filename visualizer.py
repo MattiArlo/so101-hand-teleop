@@ -2,22 +2,25 @@
 """
 SO-101 Dual-Hand Real-Time Teleoperation Visualizer
 Controls the 6-DOF SO-101 follower arm using TWO hands via laptop webcam:
-  - Left Hand  -> Arm 3D Position:
-      * Lateral (X)        -> shoulder_pan (Base Rotation Left/Right)
-      * Height (Y)         -> shoulder_lift (Arm Elevation: Hand UP -> Arm UP, Hand DOWN -> Arm DOWN)
-      * Depth/Scale (Z)    -> elbow_flex (Arm Reach Forward/Backward)
+  - Left Hand  -> Arm 3D Position (Absolute Box Mapping):
+      * Wrist Y in target box -> shoulder_lift (top=UP, bottom=DOWN)
+      * Wrist X in target box -> shoulder_pan (left=Left, right=Right)
+      * Palm scale (distance) -> elbow_flex (closer=extend, farther=retract)
   - Right Hand -> End-Effector Orientation & Gripper:
       * Wrist Tilt (Pitch) -> wrist_flex (Gripper Pitch Up/Down)
       * Wrist Roll (Roll)  -> wrist_roll (Gripper Roll CW/CCW)
       * Pinch (Distance)   -> gripper (0% Closed - 100% Open)
 
+Control Philosophy:
+  The target box on screen IS the arm's workspace. Hand at the TOP of the box
+  = arm at its highest calibrated reach. Hand at BOTTOM = arm at desk level.
+  No manual hand-zeroing needed — just place your hand in the box and go.
+
 Key Features:
-- Integrated Startup Prompt: Asks if you wish to calibrate first so everything happens in ONE command.
-- Live Real-Time Calibration Readout: Shows dynamic motor angles as you physically position the arm.
-- Offline Voice Control: Speak "On" to activate/clutch the arm, and "Off" to deactivate/freeze the arm.
-- Hand UP -> Arm UP, Hand DOWN -> Arm DOWN calibrated to your exact desk surface and ceiling clearance.
-- Decoupled Dual-Hand Control: Moving arm position does not disturb wrist tilt, roll, or pinch.
-- Dual Guided Target Boxes with elevation markers (▲ UP, ── NEUTRAL, ▼ DOWN).
+- Absolute Box-Position Mapping: Where you place your hand in the box = where the arm goes.
+- Integrated Startup Prompt: Calibrate workspace limits + teleoperate in ONE command.
+- Offline Voice Control: Speak "On" to activate, "Off" to freeze the arm.
+- Decoupled Dual-Hand Control: Position hand movement doesn't disturb wrist/grip.
 - Slew-rate velocity limiter for smooth bumpless engagement.
 """
 
@@ -180,12 +183,15 @@ def save_arm_limits(limits: Dict, file_path: Path) -> None:
 
 def wait_for_enter_with_live_readout(robot, step_title: str) -> Dict[str, float]:
     """
-    Displays live real-time motor angles in the terminal while waiting for the user
-    to physically position the arm and press [ENTER].
+    Displays step instructions clearly, then shows a live motor angle readout on a
+    SINGLE fixed line below using ANSI escape codes so instructions never scroll away.
     """
-    print("\n" + "=" * 65)
+    # Print instructions with clear visual separation
+    print("\n" + "=" * 60)
     print(step_title)
-    print("Move the arm freely by hand. Press [ENTER] to lock in position...")
+    print("-" * 60)
+    print("  >>> Move the arm by hand, then press [ENTER] to lock <<<")
+    print()  # blank line that the readout will overwrite
 
     last_print = 0.0
     while True:
@@ -195,23 +201,24 @@ def wait_for_enter_with_live_readout(robot, step_title: str) -> Dict[str, float]
             break
 
         now = time.time()
-        if now - last_print > 0.08:
+        if now - last_print > 0.15:  # slower update = less flicker, still responsive
             last_print = now
             try:
                 pos = robot.bus.sync_read("Present_Position")
                 pan = float(pos.get("shoulder_pan", 0.0))
                 lift = float(pos.get("shoulder_lift", 0.0))
                 elbow = float(pos.get("elbow_flex", 0.0))
-                wrist = float(pos.get("wrist_flex", 0.0))
-                grip = float(pos.get("gripper", 0.0))
-                sys.stdout.write(f"\r  [LIVE MOTOR ANGLES]  Pan: {pan:6.1f}° | Lift: {lift:6.1f}° | Elbow: {elbow:6.1f}° | Wrist: {wrist:6.1f}° | Grip: {grip:4.1f}%   ")
+                # Move cursor up 1 line, clear it, print readout, stay on that line
+                sys.stdout.write(f"\033[1A\033[2K  Pan:{pan:6.1f}  Lift:{lift:6.1f}  Elbow:{elbow:6.1f}\n")
                 sys.stdout.flush()
             except Exception:
                 pass
 
     # Read final position once locked
     pos = robot.bus.sync_read("Present_Position")
-    print(f"\n  ✓ Locked pose: Lift={float(pos['shoulder_lift']):.1f}°, Pan={float(pos['shoulder_pan']):.1f}°, Elbow={float(pos['elbow_flex']):.1f}°")
+    # Clear the readout line and print the locked result
+    sys.stdout.write("\033[1A\033[2K")
+    print(f"  ✓ Locked: Lift={float(pos['shoulder_lift']):.1f}°  Pan={float(pos['shoulder_pan']):.1f}°  Elbow={float(pos['elbow_flex']):.1f}°")
     return {k: float(v) for k, v in pos.items()}
 
 
@@ -453,21 +460,30 @@ def run_test_sweep(robot, limits: Dict) -> None:
 
 class DualHandPoseMapper:
     """
-    Decoupled Dual-Hand 6-DOF Mapper:
-      - Position Hand (default: Left): Controls shoulder_pan, shoulder_lift, elbow_flex
-      - Tool Hand (default: Right): Controls wrist_flex, wrist_roll, gripper
+    Decoupled Dual-Hand 6-DOF Mapper using ABSOLUTE box-position mapping.
+
+    Position Hand (default: Left):
+      - Wrist Y position within target box → shoulder_lift (top=UP, bottom=DOWN)
+      - Wrist X position within target box → shoulder_pan (left=Left, right=Right)
+      - Palm scale (hand distance to camera) → elbow_flex (closer=extend, farther=retract)
+
+    Tool Hand (default: Right):
+      - Palm rotation angle → wrist_roll
+      - Wrist-to-MCP pitch → wrist_flex
+      - Thumb-index pinch distance → gripper
+
+    The key insight: the target box on screen IS the workspace. Hand at top of
+    box = arm at its highest calibrated reach. Hand at bottom = arm at its lowest.
+    No fragile "neutral point" auto-detection needed for position control.
     """
 
-    def __init__(self, ema_alpha: float = 0.25, invert_lift: bool = False, limits: Optional[Dict] = None):
+    def __init__(self, ema_alpha: float = 0.25, invert_lift: bool = False,
+                 limits: Optional[Dict] = None,
+                 pos_box: Tuple[float, float, float, float] = (0.08, 0.18, 0.46, 0.82)):
         self.ema_alpha = ema_alpha
+        self.pos_box = pos_box  # (x1, y1, x2, y2) in normalized camera coords
 
-        # Position hand reference
-        self.pos_neutral_x = 0.27
-        self.pos_neutral_y = 0.50
-        self.pos_neutral_scale = 0.18
-        self.pos_calibrated = False
-
-        # Tool hand reference
+        # Tool hand reference (still uses relative offsets for rotation/pitch)
         self.tool_neutral_roll = 0.0
         self.tool_neutral_pitch = -70.0
         self.tool_calibrated = False
@@ -475,7 +491,7 @@ class DualHandPoseMapper:
         self.swap_roles = False
         self.invert_lift = invert_lift
 
-        # Calibrated joint elevation angles
+        # Joint range from calibrated limits
         if limits and "shoulder_lift" in limits:
             self.up_lift_deg = limits["shoulder_lift"].get("up", 15.0)
             self.down_lift_deg = limits["shoulder_lift"].get("down", 95.0)
@@ -489,6 +505,14 @@ class DualHandPoseMapper:
         self.pan_right_deg = limits.get("shoulder_pan", {}).get("right", 60.0) if limits else 60.0
         self.base_elbow = limits.get("elbow_flex", {}).get("neutral", 65.0) if limits else 65.0
 
+        # Elbow range for scale-based reach
+        self.elbow_extend = max(self.base_elbow - 40.0, DEFAULT_LIMITS["elbow_flex"][0])
+        self.elbow_retract = min(self.base_elbow + 20.0, DEFAULT_LIMITS["elbow_flex"][1])
+
+        # Reference palm scale (set on first frame for depth mapping)
+        self.pos_neutral_scale = 0.0
+        self.scale_calibrated = False
+
         # Active smoothed joint targets
         self.smoothed_joints: Dict[str, float] = {
             "shoulder_pan": 0.0,
@@ -499,12 +523,6 @@ class DualHandPoseMapper:
             "gripper": 100.0,
         }
 
-    def set_pos_neutral(self, wrist_pt: Tuple[float, float], scale: float):
-        self.pos_neutral_x = wrist_pt[0]
-        self.pos_neutral_y = wrist_pt[1]
-        self.pos_neutral_scale = max(scale, 0.05)
-        self.pos_calibrated = True
-
     def set_tool_neutral(self, roll_rad: float, pitch_deg: float):
         self.tool_neutral_roll = roll_rad
         self.tool_neutral_pitch = pitch_deg
@@ -512,42 +530,56 @@ class DualHandPoseMapper:
 
     def compute_position(self, landmarks_norm: List[Tuple[float, float, float]]) -> Tuple[Dict[str, float], Dict[str, float]]:
         """
-        Calculates 3D arm position (shoulder_pan, shoulder_lift, elbow_flex)
-        from the position hand's wrist location and palm scale.
+        Maps the position hand's wrist location ABSOLUTELY within the target box
+        to shoulder_pan, shoulder_lift, and elbow_flex.
+
+        The box boundaries define the full joint range:
+          - Box top    (y1) → arm at up_lift_deg (highest reach)
+          - Box bottom (y2) → arm at down_lift_deg (desk level)
+          - Box left   (x1) → arm at pan_left_deg
+          - Box right  (x2) → arm at pan_right_deg
+          - Box center (cx) → arm at pan 0° (straight ahead)
         """
         pts = np.array([[lm[0], lm[1], lm[2]] for lm in landmarks_norm])
         wrist = pts[0]
         middle_mcp = pts[9]
 
         scale = float(np.linalg.norm(middle_mcp[:2] - wrist[:2]))
-        if not self.pos_calibrated:
-            self.set_pos_neutral((wrist[0], wrist[1]), scale)
 
-        # 1. Shoulder Pan (Horizontal lateral deflection)
-        delta_x = wrist[0] - self.pos_neutral_x
-        norm_x = float(np.clip(delta_x / 0.18, -1.0, 1.0))
-        if norm_x < 0:
-            target_pan = norm_x * abs(self.pan_left_deg)
-        else:
-            target_pan = norm_x * abs(self.pan_right_deg)
-        target_pan = float(np.clip(target_pan, DEFAULT_LIMITS["shoulder_pan"][0], DEFAULT_LIMITS["shoulder_pan"][1]))
+        # Capture initial palm scale for depth/reach mapping
+        if not self.scale_calibrated and scale > 0.02:
+            self.pos_neutral_scale = scale
+            self.scale_calibrated = True
 
-        # 2. Shoulder Lift (Vertical deflection: Hand UP -> Arm UP, Hand DOWN -> Arm DOWN)
-        delta_y = wrist[1] - self.pos_neutral_y
-        norm_y = float(np.clip(delta_y / 0.25, -1.0, 1.0))
+        bx1, by1, bx2, by2 = self.pos_box
+
+        # 1. Shoulder Lift: Map wrist Y within box to [up_lift, down_lift]
+        #    Hand at top of box (y=by1) → up_lift (arm reaches high)
+        #    Hand at bottom of box (y=by2) → down_lift (arm reaches to desk)
+        t_y = float(np.clip((wrist[1] - by1) / (by2 - by1), 0.0, 1.0))
         if self.invert_lift:
-            norm_y = -norm_y
-
-        if norm_y < 0:
-            target_lift = self.mid_lift_deg + norm_y * (self.mid_lift_deg - self.up_lift_deg)
-        else:
-            target_lift = self.mid_lift_deg + norm_y * (self.down_lift_deg - self.mid_lift_deg)
+            t_y = 1.0 - t_y
+        target_lift = self.up_lift_deg + t_y * (self.down_lift_deg - self.up_lift_deg)
         target_lift = float(np.clip(target_lift, DEFAULT_LIMITS["shoulder_lift"][0], DEFAULT_LIMITS["shoulder_lift"][1]))
 
-        # 3. Elbow Flex (Reach / Depth via palm scale)
-        depth_ratio = (scale - self.pos_neutral_scale) / max(self.pos_neutral_scale, 1e-4)
-        norm_reach = float(np.clip(depth_ratio / 0.35, -1.0, 1.0))
-        target_elbow = float(np.clip(self.base_elbow - norm_reach * 45.0, DEFAULT_LIMITS["elbow_flex"][0], DEFAULT_LIMITS["elbow_flex"][1]))
+        # 2. Shoulder Pan: Map wrist X within box to [pan_left, pan_right]
+        #    Hand at left edge (x=bx1) → pan_left_deg
+        #    Hand at right edge (x=bx2) → pan_right_deg
+        t_x = float(np.clip((wrist[0] - bx1) / (bx2 - bx1), 0.0, 1.0))
+        target_pan = self.pan_left_deg + t_x * (self.pan_right_deg - self.pan_left_deg)
+        target_pan = float(np.clip(target_pan, DEFAULT_LIMITS["shoulder_pan"][0], DEFAULT_LIMITS["shoulder_pan"][1]))
+
+        # 3. Elbow Flex: Map palm scale to reach (closer to camera = extend arm)
+        if self.scale_calibrated and self.pos_neutral_scale > 0.02:
+            depth_ratio = (scale - self.pos_neutral_scale) / max(self.pos_neutral_scale, 0.01)
+            norm_reach = float(np.clip(depth_ratio / 0.4, -1.0, 1.0))
+            if norm_reach > 0:
+                target_elbow = self.base_elbow - norm_reach * (self.base_elbow - self.elbow_extend)
+            else:
+                target_elbow = self.base_elbow - norm_reach * (self.elbow_retract - self.base_elbow)
+        else:
+            target_elbow = self.base_elbow
+        target_elbow = float(np.clip(target_elbow, DEFAULT_LIMITS["elbow_flex"][0], DEFAULT_LIMITS["elbow_flex"][1]))
 
         pos_targets = {
             "shoulder_pan": target_pan,
@@ -555,19 +587,24 @@ class DualHandPoseMapper:
             "elbow_flex": target_elbow,
         }
 
-        # Apply EMA smoothing to position joints
+        # Apply EMA smoothing
         for k in pos_targets:
             self.smoothed_joints[k] = self.ema_alpha * pos_targets[k] + (1.0 - self.ema_alpha) * self.smoothed_joints[k]
+
+        # Compute normalized position for HUD display
+        norm_y = (t_y - 0.5) * 2.0  # -1.0 (top/UP) to +1.0 (bottom/DOWN)
+        if self.invert_lift:
+            norm_y = -norm_y
 
         metrics = {
             "wrist_x": wrist[0],
             "wrist_y": wrist[1],
             "scale": scale,
-            "delta_x": delta_x,
-            "delta_y": delta_y,
-            "norm_x": norm_x,
+            "delta_x": wrist[0] - (bx1 + bx2) / 2.0,
+            "delta_y": wrist[1] - (by1 + by2) / 2.0,
+            "norm_x": (t_x - 0.5) * 2.0,
             "norm_y": norm_y,
-            "depth_ratio": depth_ratio,
+            "depth_ratio": (scale - self.pos_neutral_scale) / max(self.pos_neutral_scale, 0.01) if self.scale_calibrated else 0.0,
         }
         return pos_targets, metrics
 
@@ -719,10 +756,10 @@ def draw_hud(panel: np.ndarray, joints: Dict[str, float], is_clutched: bool,
     step1_color = (0, 255, 120) if step1_ready else (160, 160, 160)
     cv2.putText(panel, "1. Position hands in Left & Right boxes", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.37, step1_color, 1, cv2.LINE_AA)
     y += 15
-    cv2.putText(panel, "2. Press [C] to zero neutral references", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.37, (180, 180, 180), 1, cv2.LINE_AA)
+    step2_color = (0, 255, 120) if is_clutched else (180, 180, 180)
+    cv2.putText(panel, "2. Say 'On' or hold [SPACE] to drive arm", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.37, step2_color, 1, cv2.LINE_AA)
     y += 15
-    step3_color = (0, 255, 120) if is_clutched else (180, 180, 180)
-    cv2.putText(panel, "3. Say 'On' or hold [SPACE] to drive arm", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.37, step3_color, 1, cv2.LINE_AA)
+    cv2.putText(panel, "3. [C] re-zero tool wrist orientation", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.37, (180, 180, 180), 1, cv2.LINE_AA)
 
     # Joint Gauges - Grouped by Role
     y += 20
@@ -1022,7 +1059,13 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    mapper = DualHandPoseMapper(ema_alpha=0.30, invert_lift=default_invert_lift, limits=arm_limits)
+    # Position box depends on hand role assignment
+    left_box_norm = (0.08, 0.18, 0.46, 0.82)
+    right_box_norm = (0.54, 0.18, 0.92, 0.82)
+    pos_box = left_box_norm if not default_swap else right_box_norm
+
+    mapper = DualHandPoseMapper(ema_alpha=0.30, invert_lift=default_invert_lift,
+                                limits=arm_limits, pos_box=pos_box)
     mapper.swap_roles = default_swap
 
     for k, v in current_robot_cmd.items():
@@ -1042,17 +1085,13 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
     canvas_h = 720
     canvas_w = hud_w + cam_w
 
-    left_box_norm = (0.08, 0.18, 0.46, 0.82)
-    right_box_norm = (0.54, 0.18, 0.92, 0.82)
-
     print("\nVisualizer is running!")
     print("HOW TO OPERATE:")
     print("  1. Place your LEFT hand in the left box, and RIGHT hand in the right box.")
-    print("  2. Press [C] to zero/calibrate neutral reference poses for both hands.")
-    print("  3. Speak 'On' (or hold [SPACE] or press [T]) to activate the arm!")
-    print("  4. Speak 'Off' (or release [SPACE]) to deactivate the arm.")
-    print("  5. Move LEFT hand UP to lift arm UP; move LEFT hand DOWN to lower arm DOWN.")
-    print("  6. Press [I] to invert lift direction if desired. Press [Q] to quit.\n")
+    print("  2. Say 'On' (or hold [SPACE] or press [T]) to activate the arm!")
+    print("  3. Move LEFT hand: UP=arm up, DOWN=arm down, LEFT/RIGHT=pan.")
+    print("  4. RIGHT hand: tilt wrist to pitch, roll palm to roll, pinch to grip.")
+    print("  5. Press [C] to re-zero tool hand orientation. Press [Q] to quit.\n")
 
     try:
         while True:
@@ -1211,24 +1250,23 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
                 print(f"Toggled Lift Direction -> {dir_label}")
             elif key in [ord('s'), ord('S')]:
                 mapper.swap_roles = not mapper.swap_roles
+                # Update position box to match new role assignment
+                mapper.pos_box = left_box_norm if not mapper.swap_roles else right_box_norm
                 role_str = "Left=Position, Right=Tool" if not mapper.swap_roles else "Right=Position, Left=Tool"
                 print(f"Swapped Hand Roles -> {role_str}")
             elif key in [ord('c'), ord('C')]:
-                calibrated_str = []
-                if pos_lms is not None and pos_metrics is not None:
-                    wrist_pt = (pos_lms[0][0], pos_lms[0][1])
-                    mapper.set_pos_neutral(wrist_pt, pos_metrics["scale"])
-                    calibrated_str.append(f"{pos_hand_label} (Position)")
-
+                # [C] re-zeros the tool hand orientation (roll & pitch neutral)
+                # Position hand uses absolute box mapping and doesn't need re-zeroing
                 if tool_lms is not None and tool_metrics is not None:
                     mapper.set_tool_neutral(tool_metrics.get("roll_deg", 0.0) * math.pi / 180.0,
                                             tool_metrics.get("pitch_deg", -70.0))
-                    calibrated_str.append(f"{tool_hand_label} (Tool/Gripper)")
-
-                if calibrated_str:
-                    print(f"Calibrated neutral references for: {', '.join(calibrated_str)}")
+                    # Also re-capture palm scale for elbow depth mapping
+                    if pos_lms is not None and pos_metrics is not None:
+                        mapper.pos_neutral_scale = pos_metrics["scale"]
+                        mapper.scale_calibrated = True
+                    print(f"Calibrated: Tool hand ({tool_hand_label}) neutral zeroed!")
                 else:
-                    print("Calibration note: No hands detected to calibrate.")
+                    print("Calibration note: Tool hand not detected.")
             else:
                 is_clutched = False
 
