@@ -28,6 +28,8 @@ By dividing the robot's degrees of freedom naturally between two hands, control 
 
 ## Features
 
+- **Custom Workspace Limits Calibration (`--calibrate-limits`)**: Interactively teach and save your desk's exact safe table-contact height, ceiling clearance, and pan limits in 20 seconds.
+- **Safe Dry-Run Sweep (`--test-sweep`)**: Smoothly verifies all motions across your calibrated limits before live teleoperation begins.
 - **Intuitive Elevation Mapping**: Moving your hand **UP** commands the arm **UP**; moving your hand **DOWN** commands the arm **DOWN**.
 - **Full On-Screen Range of Motion**: Scaled so that moving between the visual markers (`▲ UP` and `▼ DOWN`) inside the target box commands the arm's **entire useful vertical travel** without awkward off-screen reaching.
 - **Decoupled Dual-Hand Tracking**: Simultaneous 30+ FPS landmark tracking of both hands via Google MediaPipe Tasks.
@@ -77,6 +79,33 @@ conda activate so101-teleop
 # Install dependencies
 pip install -r requirements.txt
 ```
+
+---
+
+## Workspace Calibration & Verification
+
+Every desk height, mounting clamp, and workspace differs. To ensure the arm never collides with your desk or shelves and that 100% of your hand motion maps directly to your physical workspace:
+
+### 1. Teach Your Safe Workspace Limits (Recommended)
+Run the interactive calibration utility:
+```bash
+python visualizer.py --calibrate-limits --port /dev/ttyACM1
+```
+- Motor torque is disabled.
+- Follow the 5 quick prompts to physically guide the arm:
+  1. **Lowest Pick Position**: Move the gripper to gently touch the desk/table surface $\rightarrow$ press **`[ENTER]`**.
+  2. **Highest Clearance**: Move the arm to its maximum safe height in the air $\rightarrow$ press **`[ENTER]`**.
+  3. **Neutral Pose**: Move to your preferred comfortable resting pose $\rightarrow$ press **`[ENTER]`**.
+  4. **Pan Range**: Move to your leftmost and rightmost workspace bounds $\rightarrow$ press **`[ENTER]`**.
+  5. **Gripper**: Squeeze closed and open fully $\rightarrow$ press **`[ENTER]`**.
+- Limits are saved to `arm_limits.json` and automatically loaded on every launch!
+
+### 2. Verify with a Test Sweep
+You can visually verify all motions before teleoperation:
+```bash
+python visualizer.py --robot --test-sweep --port /dev/ttyACM1
+```
+The arm will gently cycle through Neutral $\rightarrow$ High $\rightarrow$ Low $\rightarrow$ Pan $\rightarrow$ Gripper to ensure everything is smooth and unobstructed before the visualizer starts.
 
 ---
 
@@ -148,6 +177,21 @@ python visualizer.py --robot --port /dev/ttyACM1
 | **`[I]`** | Invert vertical lift direction (`Up` $\leftrightarrow$ `Down`) |
 | **`[S]`** | Swap hand roles (`Left=Position, Right=Tool` $\leftrightarrow$ `Right=Position, Left=Tool`) |
 | **`[Q]`** or **`[ESC]`** | Exit application and safely disable arm torque |
+
+---
+
+## CLI Options
+
+| Argument | Description | Default |
+|---|---|---|
+| `--robot` | Connect to physical SO-101 follower arm | `False` |
+| `--port` | Robot serial port | `/dev/ttyACM1` |
+| `--calibrate-limits` | Launch interactive workspace limits calibration | `False` |
+| `--test-sweep` | Run a safe test sweep before teleoperation | `False` |
+| `--limits-file` | Path to custom workspace limits JSON | `arm_limits.json` |
+| `--swap` | Swap hand roles (Right=Position, Left=Tool) | `False` |
+| `--invert-lift` | Invert vertical elevation direction | `False` |
+| `--camera` | Webcam device index | `0` |
 
 ---
 
