@@ -2,20 +2,23 @@
 """
 SO-101 Dual-Hand Real-Time Teleoperation Visualizer
 Controls the 6-DOF SO-101 follower arm using TWO hands via laptop webcam:
-  - Left Hand  -> Arm Position (3-DOF):
+  - Left Hand  -> Arm 3D Position:
       * Lateral (X)        -> shoulder_pan (Base Rotation Left/Right)
-      * Height (Y)         -> shoulder_lift (Arm Elevation Up/Down)
+      * Height (Y)         -> shoulder_lift (Arm Elevation: Hand UP -> Arm UP, Hand DOWN -> Arm DOWN)
       * Depth/Scale (Z)    -> elbow_flex (Arm Reach Forward/Backward)
-  - Right Hand -> End-Effector Orientation & Gripper (3-DOF):
+  - Right Hand -> End-Effector Orientation & Gripper:
       * Wrist Tilt (Pitch) -> wrist_flex (Gripper Pitch Up/Down)
       * Wrist Roll (Roll)  -> wrist_roll (Gripper Roll CW/CCW)
       * Pinch (Distance)   -> gripper (0% Closed - 100% Open)
 
 Features:
+- Hand UP -> Arm UP, Hand DOWN -> Arm DOWN with calibrated full range of motion.
+- Full vertical travel fits comfortably within the on-screen target box (no off-screen stretching).
 - Complete mechanical decoupling: Moving the arm position does not disturb wrist orientation or pinch.
-- Dual guided neutral target boxes on screen for intuitive setup.
+- Dual guided neutral target boxes on screen with elevation markers (▲ UP, ── NEUTRAL, ▼ DOWN).
 - Soft bumpless engagement via software slew-rate limiter.
-- Swap hand roles hotkey ([S]) for left-handed or alternate operator preference.
+- Invert lift direction hotkey ([I]) or CLI flag (--invert-lift) for custom setups.
+- Swap hand roles hotkey ([S]) or CLI flag (--swap) for alternate operator preference.
 - Independent neutral calibration ([C]) for both hands.
 - Push-to-engage clutch ([SPACE]) and toggle continuous tracking ([T]).
 - Resizable window (cv2.WINDOW_NORMAL) with left HUD dashboard and right camera stream.
@@ -62,7 +65,7 @@ class DualHandPoseMapper:
       - Tool Hand (default: Right): Controls wrist_flex, wrist_roll, gripper
     """
 
-    def __init__(self, ema_alpha: float = 0.25):
+    def __init__(self, ema_alpha: float = 0.25, invert_lift: bool = False):
         self.ema_alpha = ema_alpha
 
         # Position hand reference (default centered in left half of screen)
@@ -79,10 +82,22 @@ class DualHandPoseMapper:
         # Role configuration: False = Left:Pos, Right:Tool; True = Right:Pos, Left:Tool
         self.swap_roles = False
 
+        # Direction invert option for lift (Default: False -> Hand UP = Arm UP, Hand DOWN = Arm DOWN)
+        self.invert_lift = invert_lift
+
+        # Calibrated joint elevation angles for Shoulder Lift:
+        # On SO-101 with standard calibration:
+        #   - More negative angle (-85 deg) lifts the arm HIGH UP into the air
+        #   - Around -15 deg is the natural mid-height operating pose
+        #   - More positive angle (+65 deg) lowers the arm DOWN towards the table
+        self.up_lift_deg = -85.0
+        self.down_lift_deg = 65.0
+        self.mid_lift_deg = -15.0
+
         # Active smoothed joint targets
         self.smoothed_joints: Dict[str, float] = {
             "shoulder_pan": 0.0,
-            "shoulder_lift": -30.0,
+            "shoulder_lift": -15.0,
             "elbow_flex": 60.0,
             "wrist_flex": -30.0,
             "wrist_roll": 0.0,
@@ -116,21 +131,36 @@ class DualHandPoseMapper:
         # 1. Shoulder Pan (Horizontal lateral deflection)
         delta_x = wrist[0] - self.pos_neutral_x
         # In mirrored display, moving left yields negative delta_x -> pan left
-        # Map +/- 0.16 screen fraction to +/- 55 degrees pan
-        target_pan = float(np.clip(delta_x / 0.16 * 55.0, DEFAULT_LIMITS["shoulder_pan"][0], DEFAULT_LIMITS["shoulder_pan"][1]))
+        # Target box width is ~0.38 screen fraction; +/- 0.18 covers full width
+        norm_x = float(np.clip(delta_x / 0.18, -1.0, 1.0))
+        target_pan = float(np.clip(norm_x * 60.0, DEFAULT_LIMITS["shoulder_pan"][0], DEFAULT_LIMITS["shoulder_pan"][1]))
 
-        # 2. Shoulder Lift & Elbow Flex (Vertical deflection & palm scale)
+        # 2. Shoulder Lift (Vertical deflection: Hand UP -> Arm UP, Hand DOWN -> Arm DOWN)
+        # In screen coordinates, top is y=0, bottom is y=1.
+        # When hand moves UP, wrist[1] < pos_neutral_y, so delta_y is negative.
+        # When hand moves DOWN, wrist[1] > pos_neutral_y, so delta_y is positive.
         delta_y = wrist[1] - self.pos_neutral_y
+        # Box vertical span is 0.18 to 0.82 (+/- 0.32 from center 0.50).
+        # We scale by 0.25 so the full physical range of motion fits comfortably inside the screen box!
+        norm_y = float(np.clip(delta_y / 0.25, -1.0, 1.0))
+        if self.invert_lift:
+            norm_y = -norm_y
+
+        # Hand UP (norm_y < 0) -> Target lift smoothly reaches self.up_lift_deg (-85 deg)
+        # Hand DOWN (norm_y > 0) -> Target lift smoothly reaches self.down_lift_deg (+65 deg)
+        if norm_y < 0:
+            target_lift = self.mid_lift_deg + norm_y * (self.mid_lift_deg - self.up_lift_deg)
+        else:
+            target_lift = self.mid_lift_deg + norm_y * (self.down_lift_deg - self.mid_lift_deg)
+        target_lift = float(np.clip(target_lift, DEFAULT_LIMITS["shoulder_lift"][0], DEFAULT_LIMITS["shoulder_lift"][1]))
+
+        # 3. Elbow Flex (Reach / Depth via palm scale)
         depth_ratio = (scale - self.pos_neutral_scale) / max(self.pos_neutral_scale, 1e-4)
-
-        base_lift = -30.0
-        base_elbow = 65.0
-
-        lift_offset = -float(delta_y / 0.16 * 45.0)  # Moving hand up on screen raises lift
-        reach_offset = float(depth_ratio * 40.0)     # Pushing hand closer to camera extends elbow
-
-        target_lift = float(np.clip(base_lift + lift_offset - reach_offset * 0.25, DEFAULT_LIMITS["shoulder_lift"][0], DEFAULT_LIMITS["shoulder_lift"][1]))
-        target_elbow = float(np.clip(base_elbow - lift_offset * 0.25 + reach_offset, DEFAULT_LIMITS["elbow_flex"][0], DEFAULT_LIMITS["elbow_flex"][1]))
+        norm_reach = float(np.clip(depth_ratio / 0.35, -1.0, 1.0))
+        base_elbow = 60.0
+        # Pushing closer (norm_reach > 0) extends elbow forward (elbow angle decreases)
+        # Pulling back (norm_reach < 0) retracts elbow (elbow angle increases)
+        target_elbow = float(np.clip(base_elbow - norm_reach * 45.0, DEFAULT_LIMITS["elbow_flex"][0], DEFAULT_LIMITS["elbow_flex"][1]))
 
         pos_targets = {
             "shoulder_pan": target_pan,
@@ -148,6 +178,8 @@ class DualHandPoseMapper:
             "scale": scale,
             "delta_x": delta_x,
             "delta_y": delta_y,
+            "norm_x": norm_x,
+            "norm_y": norm_y,
             "depth_ratio": depth_ratio,
         }
         return pos_targets, metrics
@@ -221,7 +253,7 @@ class DualHandPoseMapper:
 def draw_hud(panel: np.ndarray, joints: Dict[str, float], is_clutched: bool,
              left_detected: bool, right_detected: bool,
              left_in_box: bool, right_in_box: bool,
-             swap_roles: bool, fps: float, robot_connected: bool) -> None:
+             swap_roles: bool, invert_lift: bool, fps: float, robot_connected: bool) -> None:
     """Renders the dark control dashboard on the LEFT side of the window (380px)."""
     h, w, _ = panel.shape
     panel[:] = (20, 20, 24)
@@ -261,11 +293,15 @@ def draw_hud(panel: np.ndarray, joints: Dict[str, float], is_clutched: bool,
         cv2.putText(panel, "[ DISENGAGED - FROZEN ]", (45, y), cv2.FONT_HERSHEY_DUPLEX, 0.44, (200, 200, 255), 1, cv2.LINE_AA)
 
     y += 28
-    # Hardware Status
+    # Hardware Status & Lift Direction
     if robot_connected:
         cv2.putText(panel, "ARM: CONNECTED (/dev/ttyACM1)", (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (60, 255, 60), 1, cv2.LINE_AA)
     else:
         cv2.putText(panel, "ARM: SIMULATION (SAFE)", (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 180, 50), 1, cv2.LINE_AA)
+
+    lift_dir_str = "LIFT: NORMAL (UP=UP)" if not invert_lift else "LIFT: INVERTED (UP=DOWN)"
+    lift_dir_col = (180, 180, 180) if not invert_lift else (0, 200, 255)
+    cv2.putText(panel, lift_dir_str, (w - 165, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, lift_dir_col, 1, cv2.LINE_AA)
 
     # Operation Guide
     y += 20
@@ -294,13 +330,22 @@ def draw_hud(panel: np.ndarray, joints: Dict[str, float], is_clutched: bool,
 
     pos_joints = [
         ("shoulder_pan", "Pan (Base Yaw)", "deg"),
-        ("shoulder_lift", "Lift (Shoulder)", "deg"),
+        ("shoulder_lift", "Elevation (Lift)", "deg"),
         ("elbow_flex", "Reach (Elbow)", "deg"),
     ]
 
     for key, label, unit in pos_joints:
         y += 20
-        _draw_gauge_bar(panel, key, label, unit, joints.get(key, 0.0), y, w, color=(255, 190, 40))
+        extra_tag = ""
+        val = joints.get(key, 0.0)
+        if key == "shoulder_lift":
+            if val <= -35.0:
+                extra_tag = " [UP]"
+            elif val >= 25.0:
+                extra_tag = " [DOWN]"
+            else:
+                extra_tag = " [MID]"
+        _draw_gauge_bar(panel, key, label, unit, val, y, w, color=(255, 190, 40), suffix=extra_tag)
 
     # Section 2: Tool Hand
     y += 28
@@ -320,30 +365,31 @@ def draw_hud(panel: np.ndarray, joints: Dict[str, float], is_clutched: bool,
         _draw_gauge_bar(panel, key, label, unit, joints.get(key, 0.0), y, w, color=(80, 230, 120), is_grip=is_grip)
 
     # Keyboard Controls Footer
-    cv2.line(panel, (18, h - 130), (w - 18, h - 130), (70, 70, 75), 1)
+    cv2.line(panel, (18, h - 135), (w - 18, h - 135), (70, 70, 75), 1)
     controls = [
         "[SPACE] Hold: Engage Clutch",
         "[T] Toggle Continuous Mode",
         "[C] Calibrate Neutral Zeros",
+        "[I] Invert Lift (Up <-> Down)",
         f"[S] Swap Roles ({'L:Pos, R:Tool' if not swap_roles else 'R:Pos, L:Tool'})",
         "[Q] or [ESC] Exit",
     ]
-    cy = h - 110
+    cy = h - 115
     for c in controls:
-        cv2.putText(panel, c, (18, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (160, 160, 170), 1, cv2.LINE_AA)
+        cv2.putText(panel, c, (18, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (160, 160, 170), 1, cv2.LINE_AA)
         cy += 18
 
 
 def _draw_gauge_bar(panel: np.ndarray, key: str, label: str, unit: str,
-                    val: float, y: int, w: int, color: Tuple[int, int, int], is_grip: bool = False) -> None:
+                    val: float, y: int, w: int, color: Tuple[int, int, int], is_grip: bool = False, suffix: str = "") -> None:
     """Helper to draw a single joint gauge bar with limits and center zero marker."""
     lim_min, lim_max = DEFAULT_LIMITS[key]
     ratio = np.clip((val - lim_min) / (lim_max - lim_min + 1e-6), 0.0, 1.0)
 
     # Label & text value
     cv2.putText(panel, f"{label}:", (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (190, 190, 190), 1, cv2.LINE_AA)
-    val_str = f"{val:5.1f} {unit}"
-    cv2.putText(panel, val_str, (w - 95, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
+    val_str = f"{val:5.1f} {unit}{suffix}"
+    cv2.putText(panel, val_str, (w - 110, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
 
     # Bar background
     bar_x = 18
@@ -367,8 +413,9 @@ def _draw_gauge_bar(panel: np.ndarray, key: str, label: str, unit: str,
 
 
 def draw_target_box(cam_view: np.ndarray, norm_box: Tuple[float, float, float, float],
-                    title: str, subtext: str, in_box: bool, base_color: Tuple[int, int, int]) -> None:
-    """Draws a themed corner-bracketed target box with crosshair and title."""
+                    title: str, subtext: str, in_box: bool, base_color: Tuple[int, int, int],
+                    is_pos_box: bool = False, current_norm_y: Optional[float] = None) -> None:
+    """Draws a themed corner-bracketed target box with crosshair, elevation marks, and title."""
     h, w, _ = cam_view.shape
     x1, y1 = int(norm_box[0] * w), int(norm_box[1] * h)
     x2, y2 = int(norm_box[2] * w), int(norm_box[3] * h)
@@ -391,12 +438,37 @@ def draw_target_box(cam_view: np.ndarray, norm_box: Tuple[float, float, float, f
 
     # Center crosshair
     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-    cv2.line(cam_view, (cx - 8, cy), (cx + 8, cy), (100, 100, 100), 1, cv2.LINE_AA)
-    cv2.line(cam_view, (cx, cy - 8), (cx, cy + 8), (100, 100, 100), 1, cv2.LINE_AA)
+    cv2.line(cam_view, (cx - 10, cy), (cx + 10, cy), (120, 120, 120), 1, cv2.LINE_AA)
+    cv2.line(cam_view, (cx, cy - 10), (cx, cy + 10), (120, 120, 120), 1, cv2.LINE_AA)
+
+    # Elevation Guides for Position Box
+    if is_pos_box:
+        # Top UP marker
+        cv2.putText(cam_view, "^ HIGH (UP)", (cx - 40, y1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (140, 220, 255), 1, cv2.LINE_AA)
+        # Neutral dashed center line
+        cv2.line(cam_view, (x1 + 15, cy), (cx - 18, cy), (80, 80, 80), 1, cv2.LINE_AA)
+        cv2.line(cam_view, (cx + 18, cy), (x2 - 15, cy), (80, 80, 80), 1, cv2.LINE_AA)
+        cv2.putText(cam_view, "NEUTRAL", (cx - 26, cy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (130, 130, 130), 1, cv2.LINE_AA)
+        # Bottom DOWN marker
+        cv2.putText(cam_view, "v LOW (DOWN)", (cx - 44, y2 - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 180, 120), 1, cv2.LINE_AA)
+
+        # Elevation live status
+        if current_norm_y is not None and in_box:
+            if current_norm_y < -0.15:
+                pct = int(abs(current_norm_y) * 100)
+                status_label = f"ELEVATION: UP ({pct}%)"
+            elif current_norm_y > 0.15:
+                pct = int(current_norm_y * 100)
+                status_label = f"ELEVATION: DOWN ({pct}%)"
+            else:
+                status_label = "ELEVATION: NEUTRAL (READY)"
+        else:
+            status_label = "READY: Neutral Zone" if in_box else subtext
+    else:
+        status_label = "READY: Neutral Zone" if in_box else subtext
 
     # Box Labels
     cv2.putText(cam_view, title, (x1 + 8, y1 - 10), cv2.FONT_HERSHEY_DUPLEX, 0.44, color, 1, cv2.LINE_AA)
-    status_label = "READY: Neutral Zone" if in_box else subtext
     cv2.putText(cam_view, status_label, (x1 + 8, y2 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1, cv2.LINE_AA)
 
 
@@ -446,19 +518,20 @@ def draw_hand_skeleton(cam_view: np.ndarray, landmarks_norm: List[Tuple[float, f
 
 
 def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
-                   robot_port: str = "/dev/ttyACM1", default_swap: bool = False):
+                   robot_port: str = "/dev/ttyACM1", default_swap: bool = False,
+                   default_invert_lift: bool = False):
     print("=" * 65)
     print("SO-101 DUAL-HAND REAL-TIME TELEOPERATION")
     print("=" * 65)
     print("Division of Labor:")
-    print("  • LEFT HAND  -> 3D Arm Position (Pan, Lift, Reach)")
+    print("  • LEFT HAND  -> 3D Arm Position (Pan, Lift: Hand UP->Arm UP, Reach)")
     print("  • RIGHT HAND -> Tool Orientation & Gripper (Pitch, Roll, Pinch)")
     print("=" * 65)
 
     robot = None
     current_robot_cmd: Dict[str, float] = {
         "shoulder_pan": 0.0,
-        "shoulder_lift": -30.0,
+        "shoulder_lift": -15.0,
         "elbow_flex": 60.0,
         "wrist_flex": -30.0,
         "wrist_roll": 0.0,
@@ -513,7 +586,7 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    mapper = DualHandPoseMapper(ema_alpha=0.30)
+    mapper = DualHandPoseMapper(ema_alpha=0.30, invert_lift=default_invert_lift)
     mapper.swap_roles = default_swap
 
     # Initialize mapper smoothed joints to current robot pose
@@ -535,16 +608,18 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
     canvas_w = hud_w + cam_w
 
     # Target Box Coordinates in normalized camera space [x1, y1, x2, y2]
-    left_box_norm = (0.08, 0.20, 0.46, 0.80)
-    right_box_norm = (0.54, 0.20, 0.92, 0.80)
+    # Height span is 0.18 to 0.82 (roomy, comfortable on-screen bounds)
+    left_box_norm = (0.08, 0.18, 0.46, 0.82)
+    right_box_norm = (0.54, 0.18, 0.92, 0.82)
 
     print("\nVisualizer is running!")
     print("HOW TO OPERATE:")
     print("  1. Place your LEFT hand in the left box, and RIGHT hand in the right box.")
     print("  2. Press [C] to zero/calibrate neutral reference poses for both hands.")
     print("  3. Hold [SPACE] to smoothly drive the arm (or press [T] to toggle continuous mode).")
-    print("  4. Press [S] to swap hand roles if desired.")
-    print("  5. Drag window borders to resize as desired. Press [Q] to quit.\n")
+    print("  4. Move LEFT hand UP to lift arm UP; move LEFT hand DOWN to lower arm DOWN.")
+    print("  5. Press [I] to invert lift direction if ever needed.")
+    print("  6. Press [S] to swap hand roles if desired. Press [Q] to quit.\n")
 
     try:
         while True:
@@ -625,8 +700,16 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
             left_title = "LEFT: ARM POSITION" if not mapper.swap_roles else "LEFT: WRIST & GRIPPER"
             right_title = "RIGHT: WRIST & GRIPPER" if not mapper.swap_roles else "RIGHT: ARM POSITION"
 
-            draw_target_box(cam_view, left_box_norm, left_title, "Hold Left Hand Here", left_in_box, base_color=(180, 140, 60))
-            draw_target_box(cam_view, right_box_norm, right_title, "Hold Right Hand Here", right_in_box, base_color=(60, 160, 180))
+            current_pos_norm_y = pos_metrics["norm_y"] if pos_metrics is not None else None
+            left_is_pos = not mapper.swap_roles
+
+            draw_target_box(cam_view, left_box_norm, left_title, "Hold Left Hand Here", left_in_box,
+                            base_color=(180, 140, 60), is_pos_box=left_is_pos,
+                            current_norm_y=current_pos_norm_y if left_is_pos else None)
+
+            draw_target_box(cam_view, right_box_norm, right_title, "Hold Right Hand Here", right_in_box,
+                            base_color=(60, 160, 180), is_pos_box=(not left_is_pos),
+                            current_norm_y=current_pos_norm_y if (not left_is_pos) else None)
 
             # Draw Hand Skeletons
             if left_hand_lms is not None:
@@ -672,6 +755,7 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
                 left_in_box=left_in_box,
                 right_in_box=right_in_box,
                 swap_roles=mapper.swap_roles,
+                invert_lift=mapper.invert_lift,
                 fps=fps,
                 robot_connected=(robot is not None and robot.is_connected)
             )
@@ -689,6 +773,10 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
             elif key in [ord('t'), ord('T')]:
                 toggle_clutch = not toggle_clutch
                 print(f"Continuous Clutch: {'ENABLED' if toggle_clutch else 'DISABLED'}")
+            elif key in [ord('i'), ord('I')]:
+                mapper.invert_lift = not mapper.invert_lift
+                dir_label = "INVERTED (Up=Down)" if mapper.invert_lift else "NORMAL (Up=Up)"
+                print(f"Toggled Lift Direction -> {dir_label}")
             elif key in [ord('s'), ord('S')]:
                 mapper.swap_roles = not mapper.swap_roles
                 role_str = "Left=Position, Right=Tool" if not mapper.swap_roles else "Right=Position, Left=Tool"
@@ -727,11 +815,13 @@ def main():
     parser = argparse.ArgumentParser(description="SO-101 Dual-Hand Real-Time Teleoperation Visualizer")
     parser.add_argument("--camera", type=int, default=0, help="Camera index (default: 0)")
     parser.add_argument("--swap", action="store_true", help="Swap hand roles (Right=Position, Left=Tool)")
+    parser.add_argument("--invert-lift", action="store_true", help="Invert vertical shoulder lift direction")
     parser.add_argument("--robot", action="store_true", help="Connect to physical SO-101 follower arm")
     parser.add_argument("--port", type=str, default="/dev/ttyACM1", help="Follower robot serial port (default: /dev/ttyACM1)")
     args = parser.parse_args()
 
-    run_visualizer(camera_id=args.camera, connect_robot=args.robot, robot_port=args.port, default_swap=args.swap)
+    run_visualizer(camera_id=args.camera, connect_robot=args.robot, robot_port=args.port,
+                   default_swap=args.swap, default_invert_lift=args.invert_lift)
 
 
 if __name__ == "__main__":

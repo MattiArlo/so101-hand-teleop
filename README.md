@@ -13,8 +13,14 @@ A real-time computer vision teleoperation system for the **SO-101 (and SO-100) r
 Controlling all 6 degrees of freedom on a single hand introduces severe mechanical coupling: rotating your wrist or squeezing your fingers unintentionally shifts your palm in space, nudging the arm off-target right when grasping.
 
 By dividing the robot's degrees of freedom naturally between two hands, control becomes intuitive and completely decoupled:
-- **Left Hand ("3D Arm Joystick")**: Focuses entirely on gross 3D spatial positioning (Pan, Lift, Reach). You can keep an open, relaxed hand without worrying about wrist roll or pinching.
-- **Right Hand ("End-Effector Wand")**: Focuses entirely on tool orientation and grasping (Wrist Flex, Wrist Roll, Gripper Pinch). Rotating or pinching your right fingers never affects the arm's 3D position!
+- **Left Hand ("3D Arm Joystick")**: Focuses entirely on gross 3D spatial positioning:
+  - **Move Hand Up / Down** $\rightarrow$ **Arm moves UP / DOWN** (calibrated full range of motion that fits completely inside the on-screen target box).
+  - **Move Hand Left / Right** $\rightarrow$ **Arm pans Left / Right**.
+  - **Push / Pull Hand** $\rightarrow$ **Arm reaches forward / retracts back**.
+- **Right Hand ("End-Effector Wand")**: Focuses entirely on tool orientation and grasping:
+  - **Wrist Tilt / Pitch** $\rightarrow$ **Gripper tilts Up / Down**.
+  - **Wrist Roll** $\rightarrow$ **Gripper rotates CW / CCW**.
+  - **Pinch Thumb & Index** $\rightarrow$ **Gripper closes (0% pinch) to open (100%)**.
 
 *(Note: Left-handed or alternate operator preference? Press **`[S]`** to swap hand roles instantly!)*
 
@@ -22,16 +28,17 @@ By dividing the robot's degrees of freedom naturally between two hands, control 
 
 ## Features
 
+- **Intuitive Elevation Mapping**: Moving your hand **UP** commands the arm **UP**; moving your hand **DOWN** commands the arm **DOWN**.
+- **Full On-Screen Range of Motion**: Scaled so that moving between the visual markers (`▲ UP` and `▼ DOWN`) inside the target box commands the arm's **entire useful vertical travel** without awkward off-screen reaching.
 - **Decoupled Dual-Hand Tracking**: Simultaneous 30+ FPS landmark tracking of both hands via Google MediaPipe Tasks.
-- **Natural Degree-of-Freedom Division**:
-  - **Left Hand**: `shoulder_pan`, `shoulder_lift`, `elbow_flex` (3-DOF Arm Position)
-  - **Right Hand**: `wrist_flex`, `wrist_roll`, `gripper` (3-DOF Tool & Grasp)
 - **Side-by-Side Dual-Pane UI**: Dark HUD control dashboard on the left (380px), completely unobstructed live camera view on the right (960px).
-- **Dual Guided Neutral Target Boxes**: On-screen corner brackets with crosshairs and real-time color feedback (`READY: Neutral Zone`).
+- **Dual Guided Target Boxes**: On-screen corner brackets with crosshairs, elevation guides (`▲ HIGH (UP)`, `── NEUTRAL ──`, `▼ LOW (DOWN)`), and real-time color feedback.
 - **Bumpless Soft Engagement**: Software slew-rate limiter gently glides the arm from its resting position to your hand targets (~42°/sec max), preventing sudden jerks.
 - **Calibrated 2D Pinch Gripper**: Ultra-sensitive pinch detection (0% fully closed to 100% open) normalized by hand scale.
-- **Role Swap Support**: Toggle between `Left=Position, Right=Tool` and `Right=Position, Left=Tool` at runtime with `[S]` or CLI flag `--swap`.
-- **Independent Calibration**: Press `[C]` to zero both hands simultaneously (or calibrate whichever hand is currently in frame).
+- **Runtime Direction & Role Toggles**:
+  - Press **`[I]`** (or `--invert-lift`) to invert lift direction if desired.
+  - Press **`[S]`** (or `--swap`) to swap hand roles (`Left=Position, Right=Tool` $\leftrightarrow$ `Right=Position, Left=Tool`).
+- **Independent Calibration**: Press **`[C]`** to zero both hands simultaneously at your comfortable resting height.
 - **Live Hardware Integration**: Seamlessly interfaces with LeRobot's `SOFollower` and Feetech STS3215 bus.
 
 ---
@@ -41,7 +48,7 @@ By dividing the robot's degrees of freedom naturally between two hands, control 
 ```mermaid
 flowchart LR
     A["Webcam (/dev/video0)"] --> B["MediaPipe HandLandmarker\n(num_hands=2)"]
-    B --> C["Left Hand: Position\n(X -> Pan, Y -> Lift, Scale -> Reach)"]
+    B --> C["Left Hand: Position\n(X -> Pan, Y -> Up/Down, Scale -> Reach)"]
     B --> D["Right Hand: Tool & Gripper\n(Pitch -> Flex, Roll -> Roll, Pinch -> Gripper)"]
     C --> E["Safety Pipeline\n(Slew-Rate Limiter, Calibrated Limits, Clutch)"]
     D --> E
@@ -96,8 +103,8 @@ python visualizer.py --robot --port /dev/ttyACM1
 ### Left Hand: Arm Position (3-DOF)
 | Hand Gesture | Controlled Joint | Description |
 |---|---|---|
-| **Move Hand Left / Right** | `shoulder_pan` | Rotates base yaw left or right ($\pm 55^\circ$) |
-| **Move Hand Up / Down** | `shoulder_lift` | Elevates or lowers the main arm |
+| **Move Hand Up / Down** | `shoulder_lift` | **Lifts arm UP (hand up) or lowers arm DOWN (hand down)** |
+| **Move Hand Left / Right** | `shoulder_pan` | Rotates base yaw left or right ($\pm 60^\circ$) |
 | **Push Hand Closer to Camera** | `elbow_flex` | Extends arm reach forward |
 | **Pull Hand Back Away from Camera** | `elbow_flex` | Retracts arm back towards base |
 
@@ -119,13 +126,15 @@ python visualizer.py --robot --port /dev/ttyACM1
    - Place your **Right Hand** inside the right target box on screen.
 3. Observe both target boxes turn **glowing green** (`READY: Neutral Zone`).
 4. **Press `[C]`** on your keyboard:
-   - Sets your current left hand position/depth as the arm position neutral zero.
-   - Sets your current right hand roll and tilt as the wrist neutral reference.
+   - Calibrates your current hand height and position as the neutral reference.
 5. **Engage Clutch**:
    - **Hold `[SPACE]`** for momentary clutch (arm moves while held, freezes when released).
    - Or **press `[T]`** to toggle continuous teleoperation mode.
    - The arm smoothly glides into alignment via the slew-rate limiter.
-6. **Operate**: Move your left hand in 3D to place the arm in space; use your right hand to orient the gripper and pinch to grasp objects!
+6. **Move hand up and down**:
+   - Move your hand up towards `▲ HIGH (UP)` to lift the arm into the air.
+   - Move your hand down towards `▼ LOW (DOWN)` to reach down to the desk.
+   - The entire range of motion is achieved comfortably inside the target box!
 
 ---
 
@@ -136,6 +145,7 @@ python visualizer.py --robot --port /dev/ttyACM1
 | **`[SPACE]`** (Hold) | Engage clutch (streams motion to follower arm) |
 | **`[T]`** | Toggle continuous tracking ON / OFF |
 | **`[C]`** | Calibrate / zero neutral reference poses for both hands |
+| **`[I]`** | Invert vertical lift direction (`Up` $\leftrightarrow$ `Down`) |
 | **`[S]`** | Swap hand roles (`Left=Position, Right=Tool` $\leftrightarrow$ `Right=Position, Left=Tool`) |
 | **`[Q]`** or **`[ESC]`** | Exit application and safely disable arm torque |
 
