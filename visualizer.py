@@ -11,26 +11,23 @@ Controls the 6-DOF SO-101 follower arm using TWO hands via laptop webcam:
       * Wrist Roll (Roll)  -> wrist_roll (Gripper Roll CW/CCW)
       * Pinch (Distance)   -> gripper (0% Closed - 100% Open)
 
-Features:
-- Workspace Limits Calibration (--calibrate-limits): Interactively teach lowest desk contact,
-  highest ceiling reach, neutral working pose, and base pan limits in 20 seconds.
-- Safe Dry-Run Sweep (--test-sweep): Smoothly verifies all motions before teleoperation begins.
-- Hand UP -> Arm UP, Hand DOWN -> Arm DOWN with calibrated full range of motion.
-- Full vertical travel fits comfortably within the on-screen target box (no off-screen stretching).
-- Complete mechanical decoupling: Moving the arm position does not disturb wrist orientation or pinch.
-- Dual guided neutral target boxes on screen with elevation markers (▲ UP, ── NEUTRAL, ▼ DOWN).
-- Soft bumpless engagement via software slew-rate limiter.
-- Invert lift direction hotkey ([I]) or CLI flag (--invert-lift) for custom setups.
-- Swap hand roles hotkey ([S]) or CLI flag (--swap) for alternate operator preference.
-- Independent neutral calibration ([C]) for both hands.
-- Push-to-engage clutch ([SPACE]) and toggle continuous tracking ([T]).
-- Resizable window (cv2.WINDOW_NORMAL) with left HUD dashboard and right camera stream.
+Key Features:
+- Integrated Startup Prompt: Asks if you wish to calibrate first so everything happens in ONE command.
+- Live Real-Time Calibration Readout: Shows dynamic motor angles as you physically position the arm.
+- Offline Voice Control: Speak "On" to activate/clutch the arm, and "Off" to deactivate/freeze the arm.
+- Hand UP -> Arm UP, Hand DOWN -> Arm DOWN calibrated to your exact desk surface and ceiling clearance.
+- Decoupled Dual-Hand Control: Moving arm position does not disturb wrist tilt, roll, or pinch.
+- Dual Guided Target Boxes with elevation markers (▲ UP, ── NEUTRAL, ▼ DOWN).
+- Slew-rate velocity limiter for smooth bumpless engagement.
 """
 
 import argparse
 import json
 import math
+import queue
+import select
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -43,7 +40,7 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-# Default SO-101 Follower limits (from matti_follower_arm calibration in degrees / percent)
+# Default broad hardware limits from STS3215 specifications
 DEFAULT_LIMITS = {
     "shoulder_pan": (-80.0, 80.0),
     "shoulder_lift": (-95.0, 95.0),
@@ -59,9 +56,104 @@ MAX_GRIPPER_PER_FRAME = 4.0
 
 DEFAULT_MODEL_PATH = Path.home() / ".cache" / "mediapipe" / "hand_landmarker.task"
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
-DEFAULT_CALIB_PATH = Path.home() / ".cache" / "huggingface" / "lerobot" / "calibration" / "robots" / "so_follower" / "matti_follower_arm.json"
 DEFAULT_LIMITS_FILE = Path(__file__).parent / "arm_limits.json"
 
+
+# ==============================================================================
+# Voice Command Listener (Offline Keyword Spotting for "On" and "Off")
+# ==============================================================================
+
+class VoiceCommandListener:
+    """
+    100% offline, low-latency keyword recognizer using Vosk and sounddevice.
+    Listens for 'on' (activates arm clutch) and 'off' (deactivates arm clutch).
+    """
+
+    def __init__(self, sample_rate: int = 16000):
+        self.sample_rate = sample_rate
+        self.is_active: bool = False
+        self.last_command: Optional[str] = None
+        self.last_command_time: float = 0.0
+        self._running: bool = False
+        self._thread: Optional[threading.Thread] = None
+        self._stream = None
+        self._audio_queue: queue.Queue = queue.Queue()
+        self.available: bool = False
+
+        try:
+            import sounddevice as sd
+            import vosk
+            vosk.SetLogLevel(-1)  # Suppress internal Vosk logging
+            self.model = vosk.Model(lang="en-us")
+            self.rec = vosk.KaldiRecognizer(self.model, self.sample_rate, '["on", "off", "[unk]"]')
+            self.available = True
+        except Exception as e:
+            print(f"Notice: Voice control disabled ({e}).")
+            self.available = False
+
+    def start(self):
+        if not self.available:
+            return
+        import sounddevice as sd
+
+        self._running = True
+
+        def audio_callback(indata, frames, time_info, status):
+            if self._running:
+                self._audio_queue.put(bytes(indata))
+
+        try:
+            self._stream = sd.RawInputStream(
+                samplerate=self.sample_rate,
+                blocksize=4000,
+                dtype="int16",
+                channels=1,
+                callback=audio_callback
+            )
+            self._stream.start()
+            self._thread = threading.Thread(target=self._worker, daemon=True)
+            self._thread.start()
+            print("✓ Voice Command Control: ACTIVE (Say 'On' to engage arm, 'Off' to disengage)")
+        except Exception as e:
+            print(f"Warning: Could not open microphone stream for voice control ({e})")
+            self.available = False
+
+    def _worker(self):
+        while self._running:
+            try:
+                data = self._audio_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if self.rec.AcceptWaveform(data):
+                res = json.loads(self.rec.Result())
+                text = res.get("text", "").strip().lower()
+                words = text.split()
+                if "on" in words:
+                    self.is_active = True
+                    self.last_command = "ON"
+                    self.last_command_time = time.time()
+                    print("\n[VOICE COMMAND] -> 'ON' detected: ARM ACTIVATED")
+                elif "off" in words:
+                    self.is_active = False
+                    self.last_command = "OFF"
+                    self.last_command_time = time.time()
+                    print("\n[VOICE COMMAND] -> 'OFF' detected: ARM DEACTIVATED")
+
+    def stop(self):
+        self._running = False
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+        self._stream = None
+
+
+# ==============================================================================
+# Workspace Calibration & Limits Storage
+# ==============================================================================
 
 def load_arm_limits(file_path: Path) -> Optional[Dict]:
     """Loads workspace limits from JSON file if available."""
@@ -86,124 +178,47 @@ def save_arm_limits(limits: Dict, file_path: Path) -> None:
         print(f"Error saving limits file: {e}")
 
 
-def move_arm_smoothly(robot, target_pose: Dict[str, float], current_pose: Dict[str, float],
-                      max_deg_step: float = 0.8, fps: int = 50, duration: float = 3.0) -> Dict[str, float]:
-    """Smoothly glides the physical arm from current_pose to target_pose using slew-rate control."""
-    steps = int(duration * fps)
-    for _ in range(steps):
-        all_reached = True
-        for k in target_pose:
-            target = target_pose[k]
-            current = current_pose.get(k, target)
-            diff = target - current
-            if abs(diff) > 0.4:
-                all_reached = False
-            max_step = 2.5 if k == "gripper" else max_deg_step
-            step = float(np.clip(diff, -max_step, max_step))
-            current_pose[k] = current + step
+def wait_for_enter_with_live_readout(robot, step_title: str) -> Dict[str, float]:
+    """
+    Displays live real-time motor angles in the terminal while waiting for the user
+    to physically position the arm and press [ENTER].
+    """
+    print("\n" + "=" * 65)
+    print(step_title)
+    print("Move the arm freely by hand. Press [ENTER] to lock in position...")
 
-        action = {f"{k}.pos": v for k, v in current_pose.items()}
-        robot.send_action(action)
-        time.sleep(1.0 / fps)
-        if all_reached:
+    last_print = 0.0
+    while True:
+        # Check non-blocking for ENTER key press
+        if select.select([sys.stdin], [], [], 0.04)[0]:
+            sys.stdin.readline()
             break
-    return current_pose
 
+        now = time.time()
+        if now - last_print > 0.08:
+            last_print = now
+            try:
+                pos = robot.bus.sync_read("Present_Position")
+                pan = float(pos.get("shoulder_pan", 0.0))
+                lift = float(pos.get("shoulder_lift", 0.0))
+                elbow = float(pos.get("elbow_flex", 0.0))
+                wrist = float(pos.get("wrist_flex", 0.0))
+                grip = float(pos.get("gripper", 0.0))
+                sys.stdout.write(f"\r  [LIVE MOTOR ANGLES]  Pan: {pan:6.1f}° | Lift: {lift:6.1f}° | Elbow: {elbow:6.1f}° | Wrist: {wrist:6.1f}° | Grip: {grip:4.1f}%   ")
+                sys.stdout.flush()
+            except Exception:
+                pass
 
-def run_test_sweep(robot, limits: Dict) -> None:
-    """
-    Executes a slow, gentle test sweep through verified workspace limits.
-    Lets the user visually confirm unobstructed motions before teleoperation.
-    """
-    print("\n" + "=" * 60)
-    print("STARTING SAFE WORKSPACE TEST SWEEP")
-    print("=" * 60)
-    print("The arm will gently cycle through its calibrated limits.")
-    print("Press Ctrl+C to abort at any time.\n")
-
-    # Read current present position to start bumplessly
-    present_pos = robot.bus.sync_read("Present_Position")
-    current_pose = {k: float(v) for k, v in present_pos.items()}
-
-    neutral_lift = limits.get("shoulder_lift", {}).get("neutral", -15.0)
-    up_lift = limits.get("shoulder_lift", {}).get("up", -85.0)
-    down_lift = limits.get("shoulder_lift", {}).get("down", 65.0)
-    left_pan = limits.get("shoulder_pan", {}).get("left", -50.0)
-    right_pan = limits.get("shoulder_pan", {}).get("right", 50.0)
-    mid_elbow = limits.get("elbow_flex", {}).get("neutral", 60.0)
-    mid_wrist = limits.get("wrist_flex", {}).get("neutral", -30.0)
-
-    neutral_pose = {
-        "shoulder_pan": 0.0,
-        "shoulder_lift": neutral_lift,
-        "elbow_flex": mid_elbow,
-        "wrist_flex": mid_wrist,
-        "wrist_roll": 0.0,
-        "gripper": 100.0,
-    }
-
-    try:
-        # 1. Glide to Neutral
-        print(" -> [Step 1/5] Moving to Neutral Resting Pose...")
-        current_pose = move_arm_smoothly(robot, neutral_pose, current_pose, duration=2.5)
-        time.sleep(0.4)
-
-        # 2. Elevation High
-        print(f" -> [Step 2/5] Testing Elevation HIGH Reach ({up_lift:.1f}°)...")
-        high_pose = neutral_pose.copy()
-        high_pose["shoulder_lift"] = up_lift
-        current_pose = move_arm_smoothly(robot, high_pose, current_pose, duration=2.5)
-        time.sleep(0.4)
-
-        # 3. Elevation Low
-        print(f" -> [Step 3/5] Testing Elevation LOW Table Reach ({down_lift:.1f}°)...")
-        low_pose = neutral_pose.copy()
-        low_pose["shoulder_lift"] = down_lift
-        current_pose = move_arm_smoothly(robot, low_pose, current_pose, duration=3.0)
-        time.sleep(0.4)
-
-        # Return to Neutral
-        current_pose = move_arm_smoothly(robot, neutral_pose, current_pose, duration=2.5)
-        time.sleep(0.3)
-
-        # 4. Pan Left and Right
-        print(f" -> [Step 4/5] Testing Base Pan: Left ({left_pan:.1f}°) and Right ({right_pan:.1f}°)...")
-        pan_l_pose = neutral_pose.copy()
-        pan_l_pose["shoulder_pan"] = left_pan
-        current_pose = move_arm_smoothly(robot, pan_l_pose, current_pose, duration=2.0)
-        time.sleep(0.3)
-
-        pan_r_pose = neutral_pose.copy()
-        pan_r_pose["shoulder_pan"] = right_pan
-        current_pose = move_arm_smoothly(robot, pan_r_pose, current_pose, duration=2.5)
-        time.sleep(0.3)
-
-        # Return to Neutral Center
-        current_pose = move_arm_smoothly(robot, neutral_pose, current_pose, duration=2.0)
-        time.sleep(0.3)
-
-        # 5. Gripper Cycle
-        print(" -> [Step 5/5] Testing Gripper Cycle (Close -> Open)...")
-        grip_close_pose = neutral_pose.copy()
-        grip_close_pose["gripper"] = limits.get("gripper", {}).get("closed", 5.0)
-        current_pose = move_arm_smoothly(robot, grip_close_pose, current_pose, duration=1.5)
-        time.sleep(0.4)
-
-        grip_open_pose = neutral_pose.copy()
-        grip_open_pose["gripper"] = limits.get("gripper", {}).get("open", 100.0)
-        current_pose = move_arm_smoothly(robot, grip_open_pose, current_pose, duration=1.5)
-        time.sleep(0.3)
-
-        print("\n✓ TEST SWEEP COMPLETED SUCCESSFULLY! All motions verified safe.\n")
-
-    except KeyboardInterrupt:
-        print("\nTest sweep aborted by user. Holding current position.")
+    # Read final position once locked
+    pos = robot.bus.sync_read("Present_Position")
+    print(f"\n  ✓ Locked pose: Lift={float(pos['shoulder_lift']):.1f}°, Pan={float(pos['shoulder_pan']):.1f}°, Elbow={float(pos['elbow_flex']):.1f}°")
+    return {k: float(v) for k, v in pos.items()}
 
 
 def calibrate_arm_limits(robot_port: str = "/dev/ttyACM1", save_path: Path = DEFAULT_LIMITS_FILE) -> Optional[Dict]:
     """
-    Interactive guided calibration: disables motor torque and prompts the user
-    to physically guide the arm to its desired workspace boundaries.
+    Interactive guided calibration: disables motor torque, provides live dynamic angle
+    readouts, and walks the user through 4 quick steps to teach safe desk boundaries.
     """
     print("\n" + "=" * 65)
     print("SO-101 INTERACTIVE WORKSPACE LIMITS CALIBRATION")
@@ -223,70 +238,62 @@ def calibrate_arm_limits(robot_port: str = "/dev/ttyACM1", save_path: Path = DEF
         return None
 
     try:
-        print("Follow the 5 quick steps below to teach your exact safe workspace limits:\n")
-
-        # Step 1: Lowest position
-        print("-" * 65)
-        input("STEP 1: Move the arm by hand to its LOWEST position\n"
-              "        (e.g. resting on or just above your desk/table surface).\n"
-              "        Then press [ENTER] to record...")
-        pos_low = robot.bus.sync_read("Present_Position")
+        # Step 1: Lowest position touching the desk
+        step1 = ("STEP 1: Move the arm so the gripper is at your DESK SURFACE / TABLE\n"
+                 "        (This will be your lowest pick position).")
+        pos_low = wait_for_enter_with_live_readout(robot, step1)
         raw_down = float(pos_low["shoulder_lift"])
-        print(f"  ✓ Recorded Lowest Elevation: shoulder_lift = {raw_down:.1f}°")
 
-        # Step 2: Highest position
-        print("\n" + "-" * 65)
-        input("STEP 2: Move the arm by hand to its HIGHEST safe position in the air\n"
-              "        (safe clearance from shelves, monitors, or cables).\n"
-              "        Then press [ENTER] to record...")
-        pos_high = robot.bus.sync_read("Present_Position")
+        # Step 2: Highest safe reach in the air
+        step2 = ("STEP 2: Move the arm to its HIGHEST safe reach in the air\n"
+                 "        (Ensure clearance from shelves, monitors, and cables).")
+        pos_high = wait_for_enter_with_live_readout(robot, step2)
         raw_up = float(pos_high["shoulder_lift"])
-        print(f"  ✓ Recorded Highest Elevation: shoulder_lift = {raw_up:.1f}°")
 
-        # Validate lift direction: up is smaller/more negative, down is larger/more positive
-        up_lift = min(raw_up, raw_down)
-        down_lift = max(raw_up, raw_down)
-
-        # Step 3: Neutral Working Pose
-        print("\n" + "-" * 65)
-        input("STEP 3: Move the arm by hand to your preferred NEUTRAL / mid-height resting pose.\n"
-              "        Then press [ENTER] to record...")
-        pos_mid = robot.bus.sync_read("Present_Position")
+        # Step 3: Preferred Neutral resting pose
+        step3 = ("STEP 3: Move the arm to your preferred NEUTRAL working pose\n"
+                 "        (A comfortable mid-height elevation between desk and top reach).")
+        pos_mid = wait_for_enter_with_live_readout(robot, step3)
         mid_lift = float(pos_mid["shoulder_lift"])
         mid_elbow = float(pos_mid["elbow_flex"])
         mid_wrist = float(pos_mid["wrist_flex"])
-        print(f"  ✓ Recorded Neutral Pose: shoulder_lift={mid_lift:.1f}°, elbow_flex={mid_elbow:.1f}°, wrist_flex={mid_wrist:.1f}°")
 
-        # Step 4: Base Pan Range
-        print("\n" + "-" * 65)
-        input("STEP 4a: Rotate the base by hand to the LEFTMOST limit of your workspace.\n"
-              "         Then press [ENTER] to record...")
-        pos_left = robot.bus.sync_read("Present_Position")
-        left_pan = float(pos_left["shoulder_pan"])
-        print(f"  ✓ Recorded Left Pan: shoulder_pan = {left_pan:.1f}°")
+        # Step 4: Base pan boundaries
+        step4a = "STEP 4a: Rotate the arm base by hand to your LEFT workspace boundary."
+        pos_left = wait_for_enter_with_live_readout(robot, step4a)
+        pan_left = float(pos_left["shoulder_pan"])
 
-        input("STEP 4b: Rotate the base by hand to the RIGHTMOST limit of your workspace.\n"
-              "         Then press [ENTER] to record...")
-        pos_right = robot.bus.sync_read("Present_Position")
-        right_pan = float(pos_right["shoulder_pan"])
-        print(f"  ✓ Recorded Right Pan: shoulder_pan = {right_pan:.1f}°")
+        step4b = "STEP 4b: Rotate the arm base by hand to your RIGHT workspace boundary."
+        pos_right = wait_for_enter_with_live_readout(robot, step4b)
+        pan_right = float(pos_right["shoulder_pan"])
 
-        min_pan = min(left_pan, right_pan)
-        max_pan = max(left_pan, right_pan)
-
-        # Step 5: Gripper Range
-        print("\n" + "-" * 65)
-        input("STEP 5a: Squeeze the gripper fully CLOSED by hand.\n"
-              "         Then press [ENTER] to record...")
-        pos_closed = robot.bus.sync_read("Present_Position")
+        # Step 5: Gripper closed & open
+        step5a = "STEP 5a: Squeeze the gripper fully CLOSED by hand."
+        pos_closed = wait_for_enter_with_live_readout(robot, step5a)
         grip_closed = float(pos_closed["gripper"])
-        print(f"  ✓ Recorded Gripper Closed: gripper = {grip_closed:.1f}%")
 
-        input("STEP 5b: Open the gripper fully by hand.\n"
-              "         Then press [ENTER] to record...")
-        pos_open = robot.bus.sync_read("Present_Position")
+        step5b = "STEP 5b: Open the gripper fully by hand."
+        pos_open = wait_for_enter_with_live_readout(robot, step5b)
         grip_open = float(pos_open["gripper"])
-        print(f"  ✓ Recorded Gripper Open: gripper = {grip_open:.1f}%")
+
+        # Sanity Checks & Auto-Corrections
+        # On SO-101, smaller/negative angle is UP into the air, larger/positive angle is DOWN toward desk
+        up_lift = min(raw_up, raw_down)
+        down_lift = max(raw_up, raw_down)
+
+        # Ensure mid_lift is between up and down (in case user let arm collapse under gravity)
+        if not (up_lift <= mid_lift <= down_lift):
+            print("  * Note: Recorded neutral pose was outside [up, down] bounds. Auto-centering neutral.")
+            mid_lift = (up_lift + down_lift) / 2.0
+
+        # Ensure pan range is healthy and not single-sided
+        min_pan = min(pan_left, pan_right)
+        max_pan = max(pan_left, pan_right)
+        if abs(max_pan - min_pan) < 15.0 or (min_pan >= 0 and max_pan >= 0) or (min_pan <= 0 and max_pan <= 0):
+            print("  * Note: Pan range was too narrow or one-sided. Auto-setting symmetric safe bounds.")
+            bound = max(abs(min_pan), abs(max_pan), 50.0)
+            min_pan = -bound
+            max_pan = bound
 
         min_grip = min(grip_closed, grip_open)
         max_grip = max(grip_closed, grip_open)
@@ -316,7 +323,6 @@ def calibrate_arm_limits(robot_port: str = "/dev/ttyACM1", save_path: Path = DEF
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-        # Print Summary
         print("\n" + "=" * 65)
         print("CALIBRATION SUMMARY:")
         print(f"  • Elevation (Lift) : [UP: {up_lift:.1f}°] -> [NEUTRAL: {mid_lift:.1f}°] -> [DOWN: {down_lift:.1f}°]")
@@ -326,7 +332,6 @@ def calibrate_arm_limits(robot_port: str = "/dev/ttyACM1", save_path: Path = DEF
 
         save_arm_limits(limits, save_path)
 
-        # Offer dry run sweep
         ans = input("\nWould you like to run a gentle TEST SWEEP now to verify all motions? [Y/n]: ").strip().lower()
         if ans in ["", "y", "yes"]:
             robot.bus.enable_torque()
@@ -339,6 +344,113 @@ def calibrate_arm_limits(robot_port: str = "/dev/ttyACM1", save_path: Path = DEF
         print("Robot disconnected. Calibration complete!\n")
 
 
+def move_arm_smoothly(robot, target_pose: Dict[str, float], current_pose: Dict[str, float],
+                      max_deg_step: float = 0.8, fps: int = 50, duration: float = 3.0) -> Dict[str, float]:
+    """Smoothly glides the physical arm from current_pose to target_pose using slew-rate control."""
+    steps = int(duration * fps)
+    for _ in range(steps):
+        all_reached = True
+        for k in target_pose:
+            target = target_pose[k]
+            current = current_pose.get(k, target)
+            diff = target - current
+            if abs(diff) > 0.4:
+                all_reached = False
+            max_step = 2.5 if k == "gripper" else max_deg_step
+            step = float(np.clip(diff, -max_step, max_step))
+            current_pose[k] = current + step
+
+        action = {f"{k}.pos": v for k, v in current_pose.items()}
+        robot.send_action(action)
+        time.sleep(1.0 / fps)
+        if all_reached:
+            break
+    return current_pose
+
+
+def run_test_sweep(robot, limits: Dict) -> None:
+    """Executes a slow, gentle test sweep through verified workspace limits."""
+    print("\n" + "=" * 60)
+    print("STARTING SAFE WORKSPACE TEST SWEEP")
+    print("=" * 60)
+    print("The arm will gently cycle through its calibrated limits.")
+    print("Press Ctrl+C to abort at any time.\n")
+
+    present_pos = robot.bus.sync_read("Present_Position")
+    current_pose = {k: float(v) for k, v in present_pos.items()}
+
+    neutral_lift = limits.get("shoulder_lift", {}).get("neutral", 55.0)
+    up_lift = limits.get("shoulder_lift", {}).get("up", 15.0)
+    down_lift = limits.get("shoulder_lift", {}).get("down", 95.0)
+    left_pan = limits.get("shoulder_pan", {}).get("left", -50.0)
+    right_pan = limits.get("shoulder_pan", {}).get("right", 50.0)
+    mid_elbow = limits.get("elbow_flex", {}).get("neutral", 65.0)
+    mid_wrist = limits.get("wrist_flex", {}).get("neutral", -30.0)
+
+    neutral_pose = {
+        "shoulder_pan": 0.0,
+        "shoulder_lift": neutral_lift,
+        "elbow_flex": mid_elbow,
+        "wrist_flex": mid_wrist,
+        "wrist_roll": 0.0,
+        "gripper": 100.0,
+    }
+
+    try:
+        print(" -> [Step 1/5] Moving to Neutral Resting Pose...")
+        current_pose = move_arm_smoothly(robot, neutral_pose, current_pose, duration=2.5)
+        time.sleep(0.4)
+
+        print(f" -> [Step 2/5] Testing Elevation HIGH Reach ({up_lift:.1f}°)...")
+        high_pose = neutral_pose.copy()
+        high_pose["shoulder_lift"] = up_lift
+        current_pose = move_arm_smoothly(robot, high_pose, current_pose, duration=2.5)
+        time.sleep(0.4)
+
+        print(f" -> [Step 3/5] Testing Elevation LOW Table Reach ({down_lift:.1f}°)...")
+        low_pose = neutral_pose.copy()
+        low_pose["shoulder_lift"] = down_lift
+        current_pose = move_arm_smoothly(robot, low_pose, current_pose, duration=3.0)
+        time.sleep(0.4)
+
+        current_pose = move_arm_smoothly(robot, neutral_pose, current_pose, duration=2.5)
+        time.sleep(0.3)
+
+        print(f" -> [Step 4/5] Testing Base Pan: Left ({left_pan:.1f}°) and Right ({right_pan:.1f}°)...")
+        pan_l_pose = neutral_pose.copy()
+        pan_l_pose["shoulder_pan"] = left_pan
+        current_pose = move_arm_smoothly(robot, pan_l_pose, current_pose, duration=2.0)
+        time.sleep(0.3)
+
+        pan_r_pose = neutral_pose.copy()
+        pan_r_pose["shoulder_pan"] = right_pan
+        current_pose = move_arm_smoothly(robot, pan_r_pose, current_pose, duration=2.5)
+        time.sleep(0.3)
+
+        current_pose = move_arm_smoothly(robot, neutral_pose, current_pose, duration=2.0)
+        time.sleep(0.3)
+
+        print(" -> [Step 5/5] Testing Gripper Cycle (Close -> Open)...")
+        grip_close_pose = neutral_pose.copy()
+        grip_close_pose["gripper"] = limits.get("gripper", {}).get("closed", 5.0)
+        current_pose = move_arm_smoothly(robot, grip_close_pose, current_pose, duration=1.5)
+        time.sleep(0.4)
+
+        grip_open_pose = neutral_pose.copy()
+        grip_open_pose["gripper"] = limits.get("gripper", {}).get("open", 100.0)
+        current_pose = move_arm_smoothly(robot, grip_open_pose, current_pose, duration=1.5)
+        time.sleep(0.3)
+
+        print("\n✓ TEST SWEEP COMPLETED SUCCESSFULLY! All motions verified safe.\n")
+
+    except KeyboardInterrupt:
+        print("\nTest sweep aborted by user. Holding current position.")
+
+
+# ==============================================================================
+# Dual-Hand Pose Mapper
+# ==============================================================================
+
 class DualHandPoseMapper:
     """
     Decoupled Dual-Hand 6-DOF Mapper:
@@ -349,36 +461,33 @@ class DualHandPoseMapper:
     def __init__(self, ema_alpha: float = 0.25, invert_lift: bool = False, limits: Optional[Dict] = None):
         self.ema_alpha = ema_alpha
 
-        # Position hand reference (default centered in left half of screen)
+        # Position hand reference
         self.pos_neutral_x = 0.27
         self.pos_neutral_y = 0.50
         self.pos_neutral_scale = 0.18
         self.pos_calibrated = False
 
-        # Tool hand reference (default centered in right half of screen)
+        # Tool hand reference
         self.tool_neutral_roll = 0.0
         self.tool_neutral_pitch = -70.0
         self.tool_calibrated = False
 
-        # Role configuration: False = Left:Pos, Right:Tool; True = Right:Pos, Left:Tool
         self.swap_roles = False
-
-        # Direction invert option for lift (Default: False -> Hand UP = Arm UP, Hand DOWN = Arm DOWN)
         self.invert_lift = invert_lift
 
-        # Calibrated joint elevation angles for Shoulder Lift
+        # Calibrated joint elevation angles
         if limits and "shoulder_lift" in limits:
-            self.up_lift_deg = limits["shoulder_lift"].get("up", -85.0)
-            self.down_lift_deg = limits["shoulder_lift"].get("down", 65.0)
-            self.mid_lift_deg = limits["shoulder_lift"].get("neutral", -15.0)
+            self.up_lift_deg = limits["shoulder_lift"].get("up", 15.0)
+            self.down_lift_deg = limits["shoulder_lift"].get("down", 95.0)
+            self.mid_lift_deg = limits["shoulder_lift"].get("neutral", 55.0)
         else:
-            self.up_lift_deg = -85.0
-            self.down_lift_deg = 65.0
-            self.mid_lift_deg = -15.0
+            self.up_lift_deg = 15.0
+            self.down_lift_deg = 95.0
+            self.mid_lift_deg = 55.0
 
         self.pan_left_deg = limits.get("shoulder_pan", {}).get("left", -60.0) if limits else -60.0
         self.pan_right_deg = limits.get("shoulder_pan", {}).get("right", 60.0) if limits else 60.0
-        self.base_elbow = limits.get("elbow_flex", {}).get("neutral", 60.0) if limits else 60.0
+        self.base_elbow = limits.get("elbow_flex", {}).get("neutral", 65.0) if limits else 65.0
 
         # Active smoothed joint targets
         self.smoothed_joints: Dict[str, float] = {
@@ -528,11 +637,16 @@ class DualHandPoseMapper:
         return tool_targets, metrics
 
 
+# ==============================================================================
+# UI Rendering
+# ==============================================================================
+
 def draw_hud(panel: np.ndarray, joints: Dict[str, float], is_clutched: bool,
              left_detected: bool, right_detected: bool,
              left_in_box: bool, right_in_box: bool,
              swap_roles: bool, invert_lift: bool, fps: float,
-             robot_connected: bool, is_limits_calibrated: bool = False) -> None:
+             robot_connected: bool, is_limits_calibrated: bool = False,
+             voice_active: bool = False, voice_available: bool = False) -> None:
     """Renders the dark control dashboard on the LEFT side of the window (380px)."""
     h, w, _ = panel.shape
     panel[:] = (20, 20, 24)
@@ -543,7 +657,7 @@ def draw_hud(panel: np.ndarray, joints: Dict[str, float], is_clutched: bool,
     cv2.line(panel, (18, 42), (w - 18, 42), (70, 70, 75), 1)
 
     # Hand Roles & Tracking Status
-    y = 66
+    y = 64
     left_role_name = "POSITION (3D)" if not swap_roles else "WRIST & GRIP"
     right_role_name = "WRIST & GRIP" if not swap_roles else "POSITION (3D)"
 
@@ -554,7 +668,7 @@ def draw_hud(panel: np.ndarray, joints: Dict[str, float], is_clutched: bool,
     cv2.putText(panel, f"LEFT: {left_role_name}", (38, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (230, 230, 230), 1, cv2.LINE_AA)
     cv2.putText(panel, l_status, (w - 105, y), cv2.FONT_HERSHEY_SIMPLEX, 0.40, l_color, 1, cv2.LINE_AA)
 
-    y += 24
+    y += 22
     # Right Hand Badge
     r_color = (0, 255, 120) if right_detected else (0, 140, 255)
     r_status = "TRACKED" if right_detected else "SEARCHING..."
@@ -563,48 +677,61 @@ def draw_hud(panel: np.ndarray, joints: Dict[str, float], is_clutched: bool,
     cv2.putText(panel, r_status, (w - 105, y), cv2.FONT_HERSHEY_SIMPLEX, 0.40, r_color, 1, cv2.LINE_AA)
 
     # Clutch Status Banner
-    y += 28
+    y += 26
     if is_clutched:
         cv2.rectangle(panel, (18, y - 16), (w - 18, y + 8), (0, 130, 0), -1)
-        cv2.putText(panel, "[ CLUTCH ENGAGED - ACTIVE ]", (35, y), cv2.FONT_HERSHEY_DUPLEX, 0.44, (255, 255, 255), 1, cv2.LINE_AA)
+        clutch_text = "[ CLUTCH ENGAGED - ACTIVE ]"
+        cv2.putText(panel, clutch_text, (35, y), cv2.FONT_HERSHEY_DUPLEX, 0.44, (255, 255, 255), 1, cv2.LINE_AA)
     else:
         cv2.rectangle(panel, (18, y - 16), (w - 18, y + 8), (45, 45, 80), -1)
         cv2.putText(panel, "[ DISENGAGED - FROZEN ]", (45, y), cv2.FONT_HERSHEY_DUPLEX, 0.44, (200, 200, 255), 1, cv2.LINE_AA)
 
-    y += 28
+    # Voice Command Indicator
+    y += 26
+    if voice_available:
+        if voice_active:
+            cv2.rectangle(panel, (18, y - 14), (w - 18, y + 6), (0, 90, 130), -1)
+            cv2.putText(panel, "VOICE: 'ON' DETECTED (ACTIVE)", (32, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1, cv2.LINE_AA)
+        else:
+            cv2.rectangle(panel, (18, y - 14), (w - 18, y + 6), (30, 30, 40), -1)
+            cv2.putText(panel, "VOICE: READY (Say 'On' / 'Off')", (32, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 220, 255), 1, cv2.LINE_AA)
+    else:
+        cv2.putText(panel, "VOICE: UNAVAILABLE", (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 120, 130), 1, cv2.LINE_AA)
+
+    y += 24
     # Hardware Status & Limits indicator
     if robot_connected:
-        cv2.putText(panel, "ARM: CONNECTED (/dev/ttyACM1)", (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (60, 255, 60), 1, cv2.LINE_AA)
+        cv2.putText(panel, "ARM: CONNECTED (/dev/ttyACM1)", (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (60, 255, 60), 1, cv2.LINE_AA)
     else:
-        cv2.putText(panel, "ARM: SIMULATION (SAFE)", (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 180, 50), 1, cv2.LINE_AA)
+        cv2.putText(panel, "ARM: SIMULATION (SAFE)", (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 180, 50), 1, cv2.LINE_AA)
 
     limits_str = "LIMITS: VERIFIED" if is_limits_calibrated else "LIMITS: DEFAULT"
     limits_col = (0, 255, 120) if is_limits_calibrated else (160, 160, 160)
-    cv2.putText(panel, limits_str, (w - 145, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, limits_col, 1, cv2.LINE_AA)
+    cv2.putText(panel, limits_str, (w - 135, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, limits_col, 1, cv2.LINE_AA)
 
     # Operation Guide
-    y += 20
-    cv2.line(panel, (18, y), (w - 18, y), (70, 70, 75), 1)
     y += 18
-    cv2.putText(panel, "OPERATION GUIDE:", (18, y), cv2.FONT_HERSHEY_DUPLEX, 0.44, (220, 220, 220), 1, cv2.LINE_AA)
-    y += 17
+    cv2.line(panel, (18, y), (w - 18, y), (70, 70, 75), 1)
+    y += 16
+    cv2.putText(panel, "OPERATION GUIDE:", (18, y), cv2.FONT_HERSHEY_DUPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
+    y += 16
     step1_ready = left_in_box and right_in_box
     step1_color = (0, 255, 120) if step1_ready else (160, 160, 160)
-    cv2.putText(panel, "1. Place hands in Left & Right boxes", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, step1_color, 1, cv2.LINE_AA)
-    y += 16
-    cv2.putText(panel, "2. Press [C] to calibrate neutral zeros", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1, cv2.LINE_AA)
-    y += 16
+    cv2.putText(panel, "1. Position hands in Left & Right boxes", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.37, step1_color, 1, cv2.LINE_AA)
+    y += 15
+    cv2.putText(panel, "2. Press [C] to zero neutral references", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.37, (180, 180, 180), 1, cv2.LINE_AA)
+    y += 15
     step3_color = (0, 255, 120) if is_clutched else (180, 180, 180)
-    cv2.putText(panel, "3. Hold [SPACE] to smoothly drive arm", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, step3_color, 1, cv2.LINE_AA)
+    cv2.putText(panel, "3. Say 'On' or hold [SPACE] to drive arm", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.37, step3_color, 1, cv2.LINE_AA)
 
     # Joint Gauges - Grouped by Role
-    y += 22
+    y += 20
     cv2.line(panel, (18, y), (w - 18, y), (70, 70, 75), 1)
 
     # Section 1: Position Hand
-    y += 20
+    y += 18
     pos_header = f"--- {'LEFT' if not swap_roles else 'RIGHT'} HAND: ARM POSITION ---"
-    cv2.putText(panel, pos_header, (18, y), cv2.FONT_HERSHEY_DUPLEX, 0.40, (255, 200, 80), 1, cv2.LINE_AA)
+    cv2.putText(panel, pos_header, (18, y), cv2.FONT_HERSHEY_DUPLEX, 0.39, (255, 200, 80), 1, cv2.LINE_AA)
     y += 8
 
     pos_joints = [
@@ -618,18 +745,18 @@ def draw_hud(panel: np.ndarray, joints: Dict[str, float], is_clutched: bool,
         extra_tag = ""
         val = joints.get(key, 0.0)
         if key == "shoulder_lift":
-            if val <= -35.0:
+            if val <= 35.0:
                 extra_tag = " [UP]"
-            elif val >= 25.0:
+            elif val >= 75.0:
                 extra_tag = " [DOWN]"
             else:
                 extra_tag = " [MID]"
         _draw_gauge_bar(panel, key, label, unit, val, y, w, color=(255, 190, 40), suffix=extra_tag)
 
     # Section 2: Tool Hand
-    y += 28
+    y += 26
     tool_header = f"--- {'RIGHT' if not swap_roles else 'LEFT'} HAND: WRIST & GRIP ---"
-    cv2.putText(panel, tool_header, (18, y), cv2.FONT_HERSHEY_DUPLEX, 0.40, (80, 230, 120), 1, cv2.LINE_AA)
+    cv2.putText(panel, tool_header, (18, y), cv2.FONT_HERSHEY_DUPLEX, 0.39, (80, 230, 120), 1, cv2.LINE_AA)
     y += 8
 
     tool_joints = [
@@ -643,19 +770,19 @@ def draw_hud(panel: np.ndarray, joints: Dict[str, float], is_clutched: bool,
         is_grip = (key == "gripper")
         _draw_gauge_bar(panel, key, label, unit, joints.get(key, 0.0), y, w, color=(80, 230, 120), is_grip=is_grip)
 
-    # Keyboard Controls Footer
-    cv2.line(panel, (18, h - 135), (w - 18, h - 135), (70, 70, 75), 1)
+    # Keyboard & Voice Controls Footer
+    cv2.line(panel, (18, h - 145), (w - 18, h - 145), (70, 70, 75), 1)
     controls = [
-        "[SPACE] Hold: Engage Clutch",
-        "[T] Toggle Continuous Mode",
-        "[C] Calibrate Neutral Zeros",
+        "Voice: 'On' to Engage | 'Off' to Freeze",
+        "[SPACE] Hold: Clutch | [T] Toggle Clutch",
+        "[C] Calibrate Neutral Zero References",
         "[I] Invert Lift (Up <-> Down)",
         f"[S] Swap Roles ({'L:Pos, R:Tool' if not swap_roles else 'R:Pos, L:Tool'})",
         "[Q] or [ESC] Exit",
     ]
-    cy = h - 115
+    cy = h - 125
     for c in controls:
-        cv2.putText(panel, c, (18, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (160, 160, 170), 1, cv2.LINE_AA)
+        cv2.putText(panel, c, (18, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (160, 160, 170), 1, cv2.LINE_AA)
         cy += 18
 
 
@@ -665,19 +792,16 @@ def _draw_gauge_bar(panel: np.ndarray, key: str, label: str, unit: str,
     lim_min, lim_max = DEFAULT_LIMITS[key]
     ratio = np.clip((val - lim_min) / (lim_max - lim_min + 1e-6), 0.0, 1.0)
 
-    # Label & text value
     cv2.putText(panel, f"{label}:", (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (190, 190, 190), 1, cv2.LINE_AA)
     val_str = f"{val:5.1f} {unit}{suffix}"
     cv2.putText(panel, val_str, (w - 110, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
 
-    # Bar background
     bar_x = 18
     bar_y = y + 4
     bar_w = w - 36
     bar_h = 6
     cv2.rectangle(panel, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (40, 40, 45), -1)
 
-    # Fill
     fill_w = int(bar_w * ratio)
     if is_grip:
         bar_color = (int(255 * (1.0 - ratio)), int(255 * ratio), 40)
@@ -685,7 +809,6 @@ def _draw_gauge_bar(panel: np.ndarray, key: str, label: str, unit: str,
         bar_color = color
     cv2.rectangle(panel, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), bar_color, -1)
 
-    # Center zero mark
     if lim_min < 0 < lim_max:
         center_x = int(bar_x + bar_w * (-lim_min / (lim_max - lim_min)))
         cv2.line(panel, (center_x, bar_y - 2), (center_x, bar_y + bar_h + 2), (180, 180, 180), 1)
@@ -702,7 +825,6 @@ def draw_target_box(cam_view: np.ndarray, norm_box: Tuple[float, float, float, f
     color = (0, 255, 120) if in_box else base_color
     corner_len = 24
 
-    # Corners
     cv2.line(cam_view, (x1, y1), (x1 + corner_len, y1), color, 2, cv2.LINE_AA)
     cv2.line(cam_view, (x1, y1), (x1, y1 + corner_len), color, 2, cv2.LINE_AA)
 
@@ -715,23 +837,17 @@ def draw_target_box(cam_view: np.ndarray, norm_box: Tuple[float, float, float, f
     cv2.line(cam_view, (x2, y2), (x2 - corner_len, y2), color, 2, cv2.LINE_AA)
     cv2.line(cam_view, (x2, y2), (x2, y2 - corner_len), color, 2, cv2.LINE_AA)
 
-    # Center crosshair
     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
     cv2.line(cam_view, (cx - 10, cy), (cx + 10, cy), (120, 120, 120), 1, cv2.LINE_AA)
     cv2.line(cam_view, (cx, cy - 10), (cx, cy + 10), (120, 120, 120), 1, cv2.LINE_AA)
 
-    # Elevation Guides for Position Box
     if is_pos_box:
-        # Top UP marker
         cv2.putText(cam_view, "^ HIGH (UP)", (cx - 40, y1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (140, 220, 255), 1, cv2.LINE_AA)
-        # Neutral dashed center line
         cv2.line(cam_view, (x1 + 15, cy), (cx - 18, cy), (80, 80, 80), 1, cv2.LINE_AA)
         cv2.line(cam_view, (cx + 18, cy), (x2 - 15, cy), (80, 80, 80), 1, cv2.LINE_AA)
         cv2.putText(cam_view, "NEUTRAL", (cx - 26, cy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (130, 130, 130), 1, cv2.LINE_AA)
-        # Bottom DOWN marker
         cv2.putText(cam_view, "v LOW (DOWN)", (cx - 44, y2 - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 180, 120), 1, cv2.LINE_AA)
 
-        # Elevation live status
         if current_norm_y is not None and in_box:
             if current_norm_y < -0.15:
                 pct = int(abs(current_norm_y) * 100)
@@ -746,7 +862,6 @@ def draw_target_box(cam_view: np.ndarray, norm_box: Tuple[float, float, float, f
     else:
         status_label = "READY: Neutral Zone" if in_box else subtext
 
-    # Box Labels
     cv2.putText(cam_view, title, (x1 + 8, y1 - 10), cv2.FONT_HERSHEY_DUPLEX, 0.44, color, 1, cv2.LINE_AA)
     cv2.putText(cam_view, status_label, (x1 + 8, y2 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1, cv2.LINE_AA)
 
@@ -767,11 +882,9 @@ def draw_hand_skeleton(cam_view: np.ndarray, landmarks_norm: List[Tuple[float, f
         (5, 9), (9, 13), (13, 17)
     ]
 
-    # Draw bones
     for start, end in connections:
         cv2.line(cam_view, pts_px[start], pts_px[end], bone_color, 2, cv2.LINE_AA)
 
-    # Draw joints
     for i, pt in enumerate(pts_px):
         if is_tool_hand and i in [4, 8]:
             cv2.circle(cam_view, pt, 7, (0, 255, 255), -1, cv2.LINE_AA)
@@ -782,7 +895,6 @@ def draw_hand_skeleton(cam_view: np.ndarray, landmarks_norm: List[Tuple[float, f
     tag = f"[{label.upper()}: {role_title}]"
     cv2.putText(cam_view, tag, (wrist_pt[0] - 50, wrist_pt[1] + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 120), 1, cv2.LINE_AA)
 
-    # Pinch indicator on tool hand
     if is_tool_hand:
         thumb_pt = pts_px[4]
         index_pt = pts_px[8]
@@ -796,10 +908,14 @@ def draw_hand_skeleton(cam_view: np.ndarray, landmarks_norm: List[Tuple[float, f
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, color_g, color_r), 1, cv2.LINE_AA)
 
 
+# ==============================================================================
+# Main Teleoperation Loop
+# ==============================================================================
+
 def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
                    robot_port: str = "/dev/ttyACM1", default_swap: bool = False,
                    default_invert_lift: bool = False, limits_file: Path = DEFAULT_LIMITS_FILE,
-                   do_test_sweep: bool = False):
+                   do_test_sweep: bool = False, ask_calibrate: bool = True):
     print("=" * 65)
     print("SO-101 DUAL-HAND REAL-TIME TELEOPERATION")
     print("=" * 65)
@@ -808,27 +924,54 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
     print("  • RIGHT HAND -> Tool Orientation & Gripper (Pitch, Roll, Pinch)")
     print("=" * 65)
 
-    # Load custom arm limits if present
-    arm_limits = load_arm_limits(limits_file)
-    if arm_limits:
-        print(f"✓ Loaded verified workspace limits from: {limits_file}")
-        up = arm_limits.get("shoulder_lift", {}).get("up", -85.0)
-        mid = arm_limits.get("shoulder_lift", {}).get("neutral", -15.0)
-        down = arm_limits.get("shoulder_lift", {}).get("down", 65.0)
-        p_l = arm_limits.get("shoulder_pan", {}).get("left", -60.0)
-        p_r = arm_limits.get("shoulder_pan", {}).get("right", 60.0)
-        print(f"  • Elevation: [UP: {up:.1f}°] -> [MID: {mid:.1f}°] -> [DOWN: {down:.1f}°]")
-        print(f"  • Base Pan : [{p_l:.1f}° (Left) .. {p_r:.1f}° (Right)]")
-        # Update DEFAULT_LIMITS with verified safe bounds
-        DEFAULT_LIMITS["shoulder_pan"] = (p_l, p_r)
-        DEFAULT_LIMITS["shoulder_lift"] = (min(up, down), max(up, down))
-    else:
-        print("Note: Custom arm limits not found. Using standard defaults.")
-        print("Tip: Run 'python visualizer.py --calibrate-limits' to teach your exact desk limits.")
-
     robot = None
-    mid_lift_init = arm_limits.get("shoulder_lift", {}).get("neutral", -15.0) if arm_limits else -15.0
-    mid_elbow_init = arm_limits.get("elbow_flex", {}).get("neutral", 60.0) if arm_limits else 60.0
+
+    if connect_robot:
+        # Prompt user if they wish to calibrate limits first
+        if ask_calibrate:
+            print("\nYou can verify and customize your arm workspace limits (table height, ceiling reach).")
+            try:
+                ans = input("Do you wish to calibrate the arm limits first? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "n"
+            if ans in ["y", "yes"]:
+                calibrate_arm_limits(robot_port=robot_port, save_path=limits_file)
+
+        # Load limits after possible calibration
+        arm_limits = load_arm_limits(limits_file)
+        if arm_limits:
+            print(f"\n✓ Loaded verified workspace limits from: {limits_file}")
+            up = arm_limits.get("shoulder_lift", {}).get("up", 15.0)
+            mid = arm_limits.get("shoulder_lift", {}).get("neutral", 55.0)
+            down = arm_limits.get("shoulder_lift", {}).get("down", 95.0)
+            p_l = arm_limits.get("shoulder_pan", {}).get("left", -60.0)
+            p_r = arm_limits.get("shoulder_pan", {}).get("right", 60.0)
+            print(f"  • Elevation: [UP: {up:.1f}°] -> [NEUTRAL: {mid:.1f}°] -> [DOWN: {down:.1f}°]")
+            print(f"  • Base Pan : [{p_l:.1f}° (Left) .. {p_r:.1f}° (Right)]")
+        else:
+            arm_limits = None
+            print("Note: Custom arm limits not found. Using standard defaults.")
+
+        try:
+            from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
+            print(f"Connecting to SO-101 Follower arm on {robot_port} (id: matti_follower_arm)...")
+            config = SOFollowerRobotConfig(port=robot_port, id="matti_follower_arm", use_degrees=True)
+            robot = SOFollower(config)
+            robot.connect()
+            print("Follower arm connected successfully with torque enabled!")
+
+            # Run test sweep if requested
+            if do_test_sweep and arm_limits:
+                run_test_sweep(robot, arm_limits)
+
+        except Exception as e:
+            print(f"Warning: Failed to connect to robot arm ({e}). Continuing in simulation mode.")
+            robot = None
+    else:
+        arm_limits = load_arm_limits(limits_file)
+
+    mid_lift_init = arm_limits.get("shoulder_lift", {}).get("neutral", 55.0) if arm_limits else 55.0
+    mid_elbow_init = arm_limits.get("elbow_flex", {}).get("neutral", 65.0) if arm_limits else 65.0
 
     current_robot_cmd: Dict[str, float] = {
         "shoulder_pan": 0.0,
@@ -839,34 +982,16 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
         "gripper": 100.0,
     }
 
-    if connect_robot:
-        try:
-            from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
-            print(f"Connecting to SO-101 Follower arm on {robot_port} (id: matti_follower_arm)...")
-            config = SOFollowerRobotConfig(port=robot_port, id="matti_follower_arm", use_degrees=True)
-            robot = SOFollower(config)
-            robot.connect()
-            print("Follower arm connected successfully with torque enabled!")
+    if robot is not None and robot.is_connected:
+        present_pos = robot.bus.sync_read("Present_Position")
+        for k, v in present_pos.items():
+            if k in current_robot_cmd:
+                current_robot_cmd[k] = float(v)
+        print(f"Loaded physical starting pose: {current_robot_cmd}")
 
-            # Read initial physical positions so arm never jumps on start
-            present_pos = robot.bus.sync_read("Present_Position")
-            for k, v in present_pos.items():
-                if k in current_robot_cmd:
-                    current_robot_cmd[k] = float(v)
-            print(f"Loaded physical starting pose: {current_robot_cmd}")
-
-            # Run test sweep if requested
-            if do_test_sweep and arm_limits:
-                run_test_sweep(robot, arm_limits)
-                # Re-read position after sweep
-                present_pos = robot.bus.sync_read("Present_Position")
-                for k, v in present_pos.items():
-                    if k in current_robot_cmd:
-                        current_robot_cmd[k] = float(v)
-
-        except Exception as e:
-            print(f"Warning: Failed to connect to robot arm ({e}). Continuing in simulation mode.")
-            robot = None
+    # Start Offline Voice Command Listener
+    voice_listener = VoiceCommandListener()
+    voice_listener.start()
 
     # Load MediaPipe HandLandmarker
     if not DEFAULT_MODEL_PATH.exists():
@@ -900,7 +1025,6 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
     mapper = DualHandPoseMapper(ema_alpha=0.30, invert_lift=default_invert_lift, limits=arm_limits)
     mapper.swap_roles = default_swap
 
-    # Initialize mapper smoothed joints to current robot pose
     for k, v in current_robot_cmd.items():
         mapper.smoothed_joints[k] = v
 
@@ -918,8 +1042,6 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
     canvas_h = 720
     canvas_w = hud_w + cam_w
 
-    # Target Box Coordinates in normalized camera space [x1, y1, x2, y2]
-    # Height span is 0.18 to 0.82 (roomy, comfortable on-screen bounds)
     left_box_norm = (0.08, 0.18, 0.46, 0.82)
     right_box_norm = (0.54, 0.18, 0.92, 0.82)
 
@@ -927,10 +1049,10 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
     print("HOW TO OPERATE:")
     print("  1. Place your LEFT hand in the left box, and RIGHT hand in the right box.")
     print("  2. Press [C] to zero/calibrate neutral reference poses for both hands.")
-    print("  3. Hold [SPACE] to smoothly drive the arm (or press [T] to toggle continuous mode).")
-    print("  4. Move LEFT hand UP to lift arm UP; move LEFT hand DOWN to lower arm DOWN.")
-    print("  5. Press [I] to invert lift direction if ever needed.")
-    print("  6. Press [S] to swap hand roles if desired. Press [Q] to quit.\n")
+    print("  3. Speak 'On' (or hold [SPACE] or press [T]) to activate the arm!")
+    print("  4. Speak 'Off' (or release [SPACE]) to deactivate the arm.")
+    print("  5. Move LEFT hand UP to lift arm UP; move LEFT hand DOWN to lower arm DOWN.")
+    print("  6. Press [I] to invert lift direction if desired. Press [Q] to quit.\n")
 
     try:
         while True:
@@ -962,7 +1084,6 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
             if result.hand_landmarks and result.handedness:
                 for idx, handedness in enumerate(result.handedness):
                     detected_label = handedness[0].category_name
-                    # In mirrored view, landmark x is flipped
                     lms_mirrored = [(1.0 - lm.x, lm.y, lm.z) for lm in result.hand_landmarks[idx]]
                     if detected_label == "Left" and left_hand_lms is None:
                         left_hand_lms = lms_mirrored
@@ -972,7 +1093,6 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
             left_detected = left_hand_lms is not None
             right_detected = right_hand_lms is not None
 
-            # Determine which hand is Position and which is Tool
             if not mapper.swap_roles:
                 pos_lms = left_hand_lms
                 tool_lms = right_hand_lms
@@ -984,18 +1104,15 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
                 pos_hand_label = "Right"
                 tool_hand_label = "Left"
 
-            # Compute Position Joint Targets
             pos_metrics = None
             if pos_lms is not None:
                 _, pos_metrics = mapper.compute_position(pos_lms)
 
-            # Compute Tool Joint Targets
             tool_metrics = None
             if tool_lms is not None:
                 is_right = (tool_hand_label == "Right")
                 _, tool_metrics = mapper.compute_tool(tool_lms, is_right_hand=is_right)
 
-            # Check if hands are inside their target boxes
             left_in_box = False
             right_in_box = False
 
@@ -1035,15 +1152,15 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
                 draw_hand_skeleton(cam_view, right_hand_lms, "Right", "Tool" if is_tool else "Position",
                                    is_tool_hand=is_tool, pinch_pct=grip_val, bone_color=(50, 180, 240))
 
-            # Clutch State: active when engaged and at least one hand is detected
+            # Clutch State: active when Space is held, Toggle is ON, OR Voice is 'ON'
+            voice_clutch_active = voice_listener.available and voice_listener.is_active
             any_hand_detected = left_detected or right_detected
-            active_clutch = (is_clutched or toggle_clutch) and any_hand_detected
+            active_clutch = (is_clutched or toggle_clutch or voice_clutch_active) and any_hand_detected
 
             # Smooth Bumpless Dispatch to Robot Arm
             target_joints = mapper.smoothed_joints.copy()
 
             if active_clutch:
-                # Apply slew-rate velocity limiter
                 for motor, target in target_joints.items():
                     current = current_robot_cmd[motor]
                     max_step = MAX_GRIPPER_PER_FRAME if motor == "gripper" else MAX_DEG_PER_FRAME
@@ -1070,7 +1187,9 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
                 invert_lift=mapper.invert_lift,
                 fps=fps,
                 robot_connected=(robot is not None and robot.is_connected),
-                is_limits_calibrated=is_calibrated
+                is_limits_calibrated=is_calibrated,
+                voice_active=voice_clutch_active,
+                voice_available=voice_listener.available
             )
             canvas[:, hud_w:] = cam_view
 
@@ -1095,7 +1214,6 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
                 role_str = "Left=Position, Right=Tool" if not mapper.swap_roles else "Right=Position, Left=Tool"
                 print(f"Swapped Hand Roles -> {role_str}")
             elif key in [ord('c'), ord('C')]:
-                # Calibrate neutral zeros for whichever hands are currently visible
                 calibrated_str = []
                 if pos_lms is not None and pos_metrics is not None:
                     wrist_pt = (pos_lms[0][0], pos_lms[0][1])
@@ -1118,6 +1236,7 @@ def run_visualizer(camera_id: int = 0, connect_robot: bool = False,
         cap.release()
         cv2.destroyAllWindows()
         detector.close()
+        voice_listener.stop()
         if robot is not None:
             print("Disconnecting robot arm...")
             robot.disconnect()
@@ -1131,9 +1250,10 @@ def main():
     parser.add_argument("--invert-lift", action="store_true", help="Invert vertical shoulder lift direction")
     parser.add_argument("--robot", action="store_true", help="Connect to physical SO-101 follower arm")
     parser.add_argument("--port", type=str, default="/dev/ttyACM1", help="Follower robot serial port (default: /dev/ttyACM1)")
-    parser.add_argument("--calibrate-limits", action="store_true", help="Interactive guide to teach and save custom safe workspace limits")
+    parser.add_argument("--calibrate-limits", action="store_true", help="Launch interactive workspace limits calibration")
     parser.add_argument("--test-sweep", action="store_true", help="Run a gentle test sweep through workspace limits before teleoperating")
     parser.add_argument("--limits-file", type=str, default="arm_limits.json", help="Path to arm limits JSON file (default: arm_limits.json)")
+    parser.add_argument("--no-prompt", action="store_true", help="Skip the startup calibration question")
     args = parser.parse_args()
 
     limits_path = Path(args.limits_file)
@@ -1151,7 +1271,8 @@ def main():
         default_swap=args.swap,
         default_invert_lift=args.invert_lift,
         limits_file=limits_path,
-        do_test_sweep=args.test_sweep
+        do_test_sweep=args.test_sweep,
+        ask_calibrate=(not args.no_prompt and args.robot)
     )
 
 

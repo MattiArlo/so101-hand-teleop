@@ -28,6 +28,9 @@ By dividing the robot's degrees of freedom naturally between two hands, control 
 
 ## Features
 
+- **All-in-One Startup Prompt**: Automatically asks `Do you wish to calibrate the arm workspace limits first? [y/N]` when launching with `--robot`, allowing calibration, verification, and live teleoperation in a **single command**.
+- **Offline Voice Control ("On" / "Off")**: Speak **"On"** to engage the arm clutch, and **"Off"** to freeze/deactivate the arm. 100% offline, private, and zero latency via Vosk and SoundDevice.
+- **Live Real-Time Motor Angle Readout**: The calibration utility streams real-time physical joint angles in your terminal as you move the arm by hand, with intelligent auto-centering safety fallbacks.
 - **Custom Workspace Limits Calibration (`--calibrate-limits`)**: Interactively teach and save your desk's exact safe table-contact height, ceiling clearance, and pan limits in 20 seconds.
 - **Safe Dry-Run Sweep (`--test-sweep`)**: Smoothly verifies all motions across your calibrated limits before live teleoperation begins.
 - **Intuitive Elevation Mapping**: Moving your hand **UP** commands the arm **UP**; moving your hand **DOWN** commands the arm **DOWN**.
@@ -82,48 +85,60 @@ pip install -r requirements.txt
 
 ---
 
-## Workspace Calibration & Verification
-
-Every desk height, mounting clamp, and workspace differs. To ensure the arm never collides with your desk or shelves and that 100% of your hand motion maps directly to your physical workspace:
-
-### 1. Teach Your Safe Workspace Limits (Recommended)
-Run the interactive calibration utility:
-```bash
-python visualizer.py --calibrate-limits --port /dev/ttyACM1
-```
-- Motor torque is disabled.
-- Follow the 5 quick prompts to physically guide the arm:
-  1. **Lowest Pick Position**: Move the gripper to gently touch the desk/table surface $\rightarrow$ press **`[ENTER]`**.
-  2. **Highest Clearance**: Move the arm to its maximum safe height in the air $\rightarrow$ press **`[ENTER]`**.
-  3. **Neutral Pose**: Move to your preferred comfortable resting pose $\rightarrow$ press **`[ENTER]`**.
-  4. **Pan Range**: Move to your leftmost and rightmost workspace bounds $\rightarrow$ press **`[ENTER]`**.
-  5. **Gripper**: Squeeze closed and open fully $\rightarrow$ press **`[ENTER]`**.
-- Limits are saved to `arm_limits.json` and automatically loaded on every launch!
-
-### 2. Verify with a Test Sweep
-You can visually verify all motions before teleoperation:
-```bash
-python visualizer.py --robot --test-sweep --port /dev/ttyACM1
-```
-The arm will gently cycle through Neutral $\rightarrow$ High $\rightarrow$ Low $\rightarrow$ Pan $\rightarrow$ Gripper to ensure everything is smooth and unobstructed before the visualizer starts.
-
 ---
 
-## Quickstart
+## Quickstart: All-in-One Command
 
-### 1. Simulation Mode (Safe Test without Robot)
-Run the visualizer to test tracking and familiarize yourself with two-handed control:
-```bash
-python visualizer.py
-```
+You can do **everything in a single command**! When launching with `--robot`, the system asks if you want to calibrate first:
 
-### 2. Live Follower Arm Control
-When ready to control the physical robot, add `--robot`:
 ```bash
 python visualizer.py --robot --port /dev/ttyACM1
 ```
 
-*(Note: `python teleoperate.py` is also available as a convenience launcher)*
+```text
+Do you wish to calibrate the arm workspace limits first? [y/N]:
+```
+
+- Type **`y`**: It disables motor torque, shows **live real-time motor angles** in the terminal, walks you through teaching desk contact and highest reach, optionally runs a test sweep, and then seamlessly launches teleoperation!
+- Type **`n`** (or press **`[ENTER]`**): Automatically loads your saved `arm_limits.json` and immediately launches the teleoperation dashboard.
+- Add `--no-prompt` to always jump straight to teleoperation without asking.
+
+*(Simulation only? Just run `python visualizer.py` without `--robot` to test hand tracking in the HUD).*
+
+---
+
+## Voice Control & Hands-Free Operation
+
+No need to stay tethered to the keyboard! The system includes a **100% offline, zero-latency speech listener** (powered by Vosk):
+- **Speak "On"** $\rightarrow$ Activates the arm clutch. The robot immediately starts mirroring your hand gestures.
+- **Speak "Off"** $\rightarrow$ Deactivates/freezes the arm in place safely.
+- *Status indicator*: The left HUD dashboard displays `VOICE: ON (Listening)` or `VOICE: OFF` in real time.
+
+---
+
+## Workspace Calibration & Verification
+
+Every desk height, mounting clamp, and workspace differs. The calibration utility ensures the arm never hits your desk or cables, and that 100% of your hand motion maps directly to your physical workspace:
+
+### 1. Live Terminal Calibration Readout
+When calibrating (either at startup or via `python visualizer.py --calibrate-limits --port /dev/ttyACM1`), motor torque is disabled and the terminal streams live angles as you move the arm:
+```text
+  [LIVE MOTOR ANGLES]  Pan:   12.4° | Lift:   48.2° | Elbow:   64.1° | Wrist:  -28.0° | Grip:  85.0%
+```
+- **Step 1 (Lowest Pick Position)**: Guide the gripper to touch your table surface $\rightarrow$ press **`[ENTER]`**.
+- **Step 2 (Highest Reach)**: Move the arm to its highest safe clearance in the air $\rightarrow$ press **`[ENTER]`**.
+- **Step 3 (Neutral Pose)**: Move to your comfortable resting pose $\rightarrow$ press **`[ENTER]`**.
+- **Step 4 (Pan Range)**: Move to your leftmost and rightmost workspace bounds $\rightarrow$ press **`[ENTER]`**.
+- **Step 5 (Gripper)**: Squeeze closed and open fully $\rightarrow$ press **`[ENTER]`**.
+
+*Safety Features*: Includes auto-centering protection (ensuring neutral pose stays strictly between up and down even if the arm drops under gravity) and auto-symmetric pan bounds.
+
+### 2. Gentle Test Sweep
+After calibration (or by passing `--test-sweep`), the arm gently sweeps through its limits:
+```bash
+python visualizer.py --robot --test-sweep --port /dev/ttyACM1
+```
+The arm cycles: `Neutral` $\rightarrow$ `High Reach` $\rightarrow$ `Low Desk` $\rightarrow$ `Left/Right Pan` $\rightarrow$ `Gripper Cycle`.
 
 ---
 
@@ -156,9 +171,9 @@ python visualizer.py --robot --port /dev/ttyACM1
 3. Observe both target boxes turn **glowing green** (`READY: Neutral Zone`).
 4. **Press `[C]`** on your keyboard:
    - Calibrates your current hand height and position as the neutral reference.
-5. **Engage Clutch**:
-   - **Hold `[SPACE]`** for momentary clutch (arm moves while held, freezes when released).
-   - Or **press `[T]`** to toggle continuous teleoperation mode.
+5. **Engage Clutch (Voice or Keyboard)**:
+   - **Voice**: Speak **"On"** into your microphone to engage tracking; speak **"Off"** to disengage and freeze.
+   - **Keyboard**: Hold **`[SPACE]`** for momentary clutch (arm moves while held, freezes when released), or press **`[T]`** to toggle continuous mode.
    - The arm smoothly glides into alignment via the slew-rate limiter.
 6. **Move hand up and down**:
    - Move your hand up towards `▲ HIGH (UP)` to lift the arm into the air.
@@ -167,16 +182,18 @@ python visualizer.py --robot --port /dev/ttyACM1
 
 ---
 
-## Keyboard Shortcuts
+## Controls, Voice Commands & Shortcuts
 
-| Key | Function |
-|---|---|
-| **`[SPACE]`** (Hold) | Engage clutch (streams motion to follower arm) |
-| **`[T]`** | Toggle continuous tracking ON / OFF |
-| **`[C]`** | Calibrate / zero neutral reference poses for both hands |
-| **`[I]`** | Invert vertical lift direction (`Up` $\leftrightarrow$ `Down`) |
-| **`[S]`** | Swap hand roles (`Left=Position, Right=Tool` $\leftrightarrow$ `Right=Position, Left=Tool`) |
-| **`[Q]`** or **`[ESC]`** | Exit application and safely disable arm torque |
+| Input | Action | Description |
+|---|---|---|
+| **Voice "On"** | Engage Arm | Activates arm tracking hands-free |
+| **Voice "Off"** | Disengage Arm | Deactivates arm tracking and holds position |
+| **`[SPACE]`** (Hold) | Clutch Hold | Drive arm while held, freeze on release |
+| **`[T]`** | Toggle Clutch | Toggle continuous tracking ON / OFF |
+| **`[C]`** | Zero Neutral | Calibrate neutral reference poses for both hands |
+| **`[I]`** | Invert Lift | Invert vertical lift direction (`Up` $\leftrightarrow$ `Down`) |
+| **`[S]`** | Swap Roles | Swap hand roles (`Left=Pos, Right=Tool` $\leftrightarrow$ `Right=Pos, Left=Tool`) |
+| **`[Q]`** / **`[ESC]`** | Exit | Exit application and safely disable arm torque |
 
 ---
 
@@ -186,6 +203,7 @@ python visualizer.py --robot --port /dev/ttyACM1
 |---|---|---|
 | `--robot` | Connect to physical SO-101 follower arm | `False` |
 | `--port` | Robot serial port | `/dev/ttyACM1` |
+| `--no-prompt` | Skip the startup calibration question and jump straight in | `False` |
 | `--calibrate-limits` | Launch interactive workspace limits calibration | `False` |
 | `--test-sweep` | Run a safe test sweep before teleoperation | `False` |
 | `--limits-file` | Path to custom workspace limits JSON | `arm_limits.json` |
